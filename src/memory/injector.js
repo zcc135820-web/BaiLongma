@@ -92,19 +92,17 @@ function extractKeywords(text, maxKeywords = 8) {
     if (!STOP_WORDS.has(normalized)) bump(word)
   }
 
-  // 按长度降序、频次降序排列；较短词若已被更长词覆盖则跳过
-  const sorted = [...freq.entries()]
-    .sort((a, b) => (b[0].length - a[0].length) || (b[1] - a[1]))
+  // 按频次降序 → 长度降序排列；不做子串去重
+  //
+  // 历史上这里曾用 "较短词若被更长词覆盖则跳过" 的子串去重逻辑，
+  // 但这反了：在 FTS5/LIKE 字面召回里，较短词（"业余"）比较长 ngram（"业余写什"）
+  // 更可能命中真实记忆内容。子串去重把最有用的短关键词砍掉了。
+  // 改为直接按 (频次, 长度) 排序后截前 maxKeywords，
+  // 保留所有 ngram，让短词跟长词一起进入召回池。
+  return [...freq.entries()]
+    .sort((a, b) => (b[1] - a[1]) || (b[0].length - a[0].length))
+    .slice(0, maxKeywords)
     .map(([word]) => word)
-
-  const result = []
-  for (const word of sorted) {
-    if (!result.some(selected => selected.includes(word))) {
-      result.push(word)
-    }
-    if (result.length >= maxKeywords) break
-  }
-  return result
 }
 
 // 桶内重排：salience >= 4 的提到前面（按 salience 高到低），
