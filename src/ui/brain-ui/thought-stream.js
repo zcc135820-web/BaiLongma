@@ -360,5 +360,20 @@ export class ThoughtStream {
     this.hadToolCall = false;
     this.toolFailed = false;
   }
+
+  // Called at the start of a new round (message_received / tick) to drop any
+  // dangling state from a previous round that ended without an emit('response')
+  // event — e.g. the round was aborted by a higher-priority message. Without
+  // this, the next round's startThinkingSession() would reuse the old
+  // thinkingLine in the wrong DOM position.
+  beginRound() {
+    this.stopThinking();
+    this.clearStatus();
+    this.curLine = null;
+    this.thinkingLine = null;
+    this.hadToolCall = false;
+    this.toolFailed = false;
+    this.lastToolEl = null;
+  }
 }
 

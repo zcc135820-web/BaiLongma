@@ -33,7 +33,7 @@ export const TOOL_SCHEMAS = {
     type: 'function',
     function: {
       name: 'send_message',
-      description: 'Send a message to an individual by ID. All outbound communication must use this tool; do not output reply content directly.',
+      description: 'Send a message to an individual by ID. All outbound communication must use this tool; do not output reply content directly. The same canonical user ID (e.g. ID:000001) may be reachable on multiple channels — use the optional channel parameter to override the default routing.',
       parameters: {
         type: 'object',
         properties: {
@@ -44,6 +44,11 @@ export const TOOL_SCHEMAS = {
           content: {
             type: 'string',
             description: 'Message content.'
+          },
+          channel: {
+            type: 'string',
+            enum: ['WECHAT', 'DISCORD', 'FEISHU', 'WECOM', 'TUI', 'AUTO'],
+            description: 'Optional delivery channel. AUTO (default) follows the channel of the user\'s most recent message — if they last reached you on WECHAT, your message goes to WECHAT (this also holds for follow-ups triggered later by reminders or ticks). Pass an explicit channel (e.g. TUI for long-form output that belongs on the local UI) to override.'
           }
         },
         required: ['target_id', 'content']

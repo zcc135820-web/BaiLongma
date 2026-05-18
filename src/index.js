@@ -33,6 +33,7 @@ import { collectGeoWeather, getGeoWeatherBlock } from './geo-weather.js'
 import { collectTrending, getTrendingBlock } from './trending.js'
 import { collectAgents, buildAgentContextBlock, buildDelegationAskDirections } from './agents/registry.js'
 import { tryAutoConfigureKey } from './key-auto-config.js'
+import { PRIMARY_USER_ID, formatPresenceForPrompt, normalizeChannel } from './identity.js'
 
 // On first launch, copy sandbox seed files from the resource directory to the user data directory (Electron install)
 seedSandboxOnce()
@@ -67,7 +68,6 @@ const PRIORITY = {
   user: 100,
 }
 
-const PRIMARY_USER_ID = 'ID:000001'
 const L2_CONTEXT_HOURS = 24 * 7
 const STARTUP_SELF_CHECK_VERSION = 'v1'
 const STARTUP_SELF_CHECK_CONFIG_KEY = 'l2_startup_self_check'
@@ -98,23 +98,16 @@ const EXPLORATION_INDEX_KEY = 'awakening_exploration_index'
 // ui_show("AwakeningCard", { index: N, total: 3, title: "title", finding: "one-sentence finding", emoji: "emoji" })
 const AWAKENING_EXPLORATION_TASKS = [
   // 1. Read existing memories
-  `Exploration (1/3): See what you already know.
+  `Exploration (1/2): See what you already know.
 Go through the injected memories and take stock: who do you know, what do you know, are there any threads with no follow-up.
 Do this quietly. If you find something forgotten — something the user mentioned months ago but never brought up again — you can mention it in passing, but do not ask "do you need me to handle it?".
-When done, call ui_show("AwakeningCard", { index:1, total:3, title:"Reading memories", finding:"(one sentence: the most notable lead in the memory store, or 'memory store ready')", emoji:"🧠" }).`,
+When done, call ui_show("AwakeningCard", { index:1, total:2, title:"Reading memories", finding:"(one sentence: the most notable lead in the memory store, or 'memory store ready')", emoji:"🧠" }).`,
 
   // 2. Surface an unfinished thread
-  `Exploration (2/3): Find a forgotten thread.
+  `Exploration (2/2): Find a forgotten thread.
 Look through memories — what did the user mention before but never bring up again? A plan, an idea, something they said they wanted to do but never did?
 If you find one, bring it up casually. Do not ask "do you need me to move this forward?" — just mention it and see how they react.
-When done, call ui_show("AwakeningCard", { index:2, total:3, title:"Unfinished thread", finding:"(one sentence describing the forgotten thread, or 'no open threads found')", emoji:"🔍" }).`,
-
-  // 3. Proactively do one thing based on the current moment
-  `Exploration (3/3): Based on the current time, do one thing on your own.
-Not "what do you need?" — instead, judge: what time is it, what is the user probably doing, is there something you can just do right now?
-During work hours, consider queuing a focus-friendly track; if a reminder is coming up soon, mention it early.
-Pick one thing and do it without asking first.
-When done, call ui_show("AwakeningCard", { index:3, total:3, title:"Proactive action", finding:"(one sentence saying what you did)", emoji:"⚡" }).`,
+When done, call ui_show("AwakeningCard", { index:2, total:2, title:"Unfinished thread", finding:"(one sentence describing the forgotten thread, or 'no open threads found')", emoji:"🔍" }).`,
 ]
 
 function getExplorationIndex() {
@@ -307,6 +300,33 @@ function hasNonMessageToolCall(toolCallLog = []) {
   return toolCallLog.some(t => t.name && t.name !== 'send_message')
 }
 
+// Fallback 投递：当模型未按协议调 send_message 时由主循环代为投递。
+// 用 msg 自带的 externalPartyId + channel 路由（用户从哪儿发，就回到哪儿），并写入 conversations 表。
+function deliverFallbackReply(msg, content, timestamp) {
+  const channel = msg.channel || ''
+  const externalPartyId = msg.externalPartyId || ''
+  emitEvent('message', {
+    from: 'consciousness',
+    to: msg.fromId,
+    content,
+    timestamp,
+    channel,
+    external_party_id: externalPartyId,
+  })
+  if (externalPartyId) {
+    dispatchSocialMessage(externalPartyId, content).catch(err => console.warn('[social] fallback send failed:', err.message))
+  }
+  insertConversation({
+    role: 'jarvis',
+    from_id: 'jarvis',
+    to_id: msg.fromId,
+    content,
+    timestamp,
+    channel,
+    external_party_id: externalPartyId,
+  })
+}
+
 export function buildToolContext({ currentTargetId = null, conversationWindow = [], includeRecentPartners = false } = {}) {
   const visibleTargetIds = [
     currentTargetId,
@@ -331,6 +351,9 @@ function buildToolContextForProcess(msg, injection) {
 
   return {
     ...base,
+    // 当前 turn 的渠道信息：execSendMessage 在 AUTO 模式下优先用这里，确保"在哪儿收的消息就回到哪儿"
+    currentChannel: msg?.channel || null,
+    currentExternalPartyId: msg?.externalPartyId || null,
 
     onSetTask: (description, steps) => {
       state.task = description
@@ -412,20 +435,25 @@ function buildToolContextForProcess(msg, injection) {
 
 function formatConversationMessage(row, currentMsg = null) {
   if (row.role === 'jarvis') {
+    // Jarvis 出站的渠道也标出来，让模型能"看到"自己上次回到了哪里
+    const rawChannel = row.channel || ''
+    const normalized = normalizeChannel(rawChannel)
+    const channelTag = (normalized && normalized !== 'TUI' && normalized !== 'SYSTEM') ? `[via ${normalized}] ` : ''
     return {
       role: 'assistant',
-      content: trimAssistantFluff(row.content || ''),
+      content: `${channelTag}${trimAssistantFluff(row.content || '')}`,
     }
   }
 
   // Truncate timestamp to minute precision (drop seconds and timezone)
   const ts = row.timestamp ? row.timestamp.slice(0, 16).replace('T', ' ') : ''
-  const channel = row.channel || currentMsg?.channel || ''
+  const rawChannel = row.channel || currentMsg?.channel || ''
+  const normalizedChannel = normalizeChannel(rawChannel)
 
-  const isSystemSignal = row.from_id === 'SYSTEM' || channel === 'APP_SIGNAL' || channel === 'REMINDER'
+  const isSystemSignal = row.from_id === 'SYSTEM' || normalizedChannel === 'SYSTEM' || rawChannel === 'APP_SIGNAL' || rawChannel === 'REMINDER'
 
   if (isSystemSignal) {
-    const channelLabel = channel ? ` · ${channel}` : ''
+    const channelLabel = rawChannel ? ` · ${rawChannel}` : ''
     return {
       role: 'user',
       content: `[system signal · ${ts}${channelLabel}]\n${row.content || ''}\n(Respond with tools only. Do NOT call send_message.)`.trim(),
@@ -438,8 +466,8 @@ function formatConversationMessage(row, currentMsg = null) {
     && row.timestamp === currentMsg.timestamp
     && row.content === currentMsg.content
   const marker = isCurrent ? 'current user message' : 'user message'
-  // TUI/API are default channels and are not shown; only display meaningful channel labels
-  const channelLabel = (channel && channel !== 'TUI' && channel !== 'API') ? ` · ${channel}` : ''
+  // 简化后的渠道：TUI 视为默认不显示；其他（WECHAT/DISCORD/FEISHU/WECOM）显示
+  const channelLabel = (normalizedChannel && normalizedChannel !== 'TUI') ? ` · ${normalizedChannel}` : ''
 
   return {
     role: 'user',
@@ -769,6 +797,9 @@ async function process(input, label, msg = null) {
       }, 1000)
     }
 
+    // 用户跨渠道可达性快照（让 L2 主动消息能选对渠道：用户在外面就发微信，在电脑前就发本地）
+    const presenceText = formatPresenceForPrompt(PRIMARY_USER_ID)
+
     let extraContextText = ''
     if (state.task && !fastUserPath) {
       const extraContext = await gatherContext({
@@ -845,7 +876,7 @@ async function process(input, label, msg = null) {
       hasActiveTask,
       task: state.task || null,
       taskKnowledge: taskKnowledgeText,
-      extraContext: [hotspotStateText, hotspotContextText, personCardStateText, personCardContextText, weatherContextText, docStateText, docContextText, prefetchText, extraContextText, injection.uiSignalSummary, formatActiveUICards(injection.activeUICards)].filter(Boolean).join('\n\n'),
+      extraContext: [presenceText, hotspotStateText, hotspotContextText, personCardStateText, personCardContextText, weatherContextText, docStateText, docContextText, prefetchText, extraContextText, injection.uiSignalSummary, formatActiveUICards(injection.activeUICards)].filter(Boolean).join('\n\n'),
       existenceDesc: describeExistence(birthTime),
       security: getSecurity(),
       awakeningTicks: getAwakeningTicks(),
@@ -865,8 +896,9 @@ async function process(input, label, msg = null) {
     })
 
     // Memory refresh injection (L1 user messages only)
+    // 实时用户消息（fastUserPath）跳过：刷新流程会先跑一次评估 LLM 调用，对实时聊天是硬性延迟税
     let enrichedSystemPrompt = systemPrompt
-    const shouldRefreshL1 = !isTick && msg?.content && msg.content.trim()
+    const shouldRefreshL1 = !isTick && !fastUserPath && msg?.content && msg.content.trim()
     const tickSinceLastRefresh = state.tickCounter - state.lastTaskRefreshTick
     const shouldRefreshTick = isTick && !!state.task && tickSinceLastRefresh >= 5
     if (shouldRefreshL1 || shouldRefreshTick) {
@@ -903,7 +935,7 @@ async function process(input, label, msg = null) {
             hasActiveTask,
             task: state.task || null,
             taskKnowledge: taskKnowledgeText,
-            extraContext: [hotspotStateText, hotspotContextText, personCardStateText, personCardContextText, weatherContextText, docStateText, docContextText, prefetchText, extraContextText, injection.uiSignalSummary, formatActiveUICards(injection.activeUICards)].filter(Boolean).join('\n\n'),
+            extraContext: [presenceText, hotspotStateText, hotspotContextText, personCardStateText, personCardContextText, weatherContextText, docStateText, docContextText, prefetchText, extraContextText, injection.uiSignalSummary, formatActiveUICards(injection.activeUICards)].filter(Boolean).join('\n\n'),
             existenceDesc: describeExistence(birthTime),
             security: getSecurity(),
             awakeningTicks: getAwakeningTicks(),
@@ -943,21 +975,11 @@ async function process(input, label, msg = null) {
         }
         emitEvent('tool_call', { name, args, result: resultText.slice(0, 1000), ok })
         toolCallLog.push({ name, args, result: resultText.slice(0, 500), ok })
-        // Record messages sent by Jarvis
-        if (name === 'send_message' && args?.target_id && args?.content) {
+        // 注：send_message 的 conversations 写入已由 executor.js 内统一处理（带 channel + external_party_id）
+        // 这里仅处理语音输入的 TTS 自动回放
+        if (name === 'send_message' && args?.content && isVoiceChannel(msg?.channel)) {
           const cleanedContent = trimAssistantFluff(args.content)
-          if (!cleanedContent) return
-          insertConversation({
-            role: 'jarvis',
-            from_id: 'jarvis',
-            to_id: args.target_id,
-            content: cleanedContent,
-            timestamp: nowTimestamp(),
-          })
-          // When the user sent a voice message, notify frontend to play TTS reply
-          if (isVoiceChannel(msg?.channel)) {
-            autoSpeakForVoiceReply(cleanedContent)
-          }
+          if (cleanedContent) autoSpeakForVoiceReply(cleanedContent)
         }
       },
       onRetry: ({ attempt, nextAttempt, maxAttempts, delayMs, error }) => {
@@ -1016,20 +1038,7 @@ async function process(input, label, msg = null) {
       const blockedContent = 'I did not actually call the required tool, so I cannot claim the operation completed. Please send again — I will execute the tool first, then reply based on the result.'
       console.warn(`[protocol fallback] Blocked a text reply that required a tool call but made none. from=${msg.fromId}`)
       if (isVoiceChannel(msg.channel)) autoSpeakForVoiceReply(blockedContent)
-      emitEvent('message', {
-        from: 'consciousness',
-        to: msg.fromId,
-        content: blockedContent,
-        timestamp,
-      })
-      dispatchSocialMessage(msg.fromId, blockedContent).catch(err => console.warn('[social] fallback send failed:', err.message))
-      insertConversation({
-        role: 'jarvis',
-        from_id: 'jarvis',
-        to_id: msg.fromId,
-        content: blockedContent,
-        timestamp,
-      })
+      deliverFallbackReply(msg, blockedContent, timestamp)
       toolCallLog.push({
         name: 'send_message',
         args: { target_id: msg.fromId, content: blockedContent },
@@ -1045,20 +1054,7 @@ async function process(input, label, msg = null) {
       const timestamp = nowTimestamp()
       console.warn(`[protocol fallback] Model did not call send_message — delivering response body to ${msg.fromId}`)
       if (isVoiceChannel(msg.channel)) autoSpeakForVoiceReply(fallbackContent)
-      emitEvent('message', {
-        from: 'consciousness',
-        to: msg.fromId,
-        content: fallbackContent,
-        timestamp,
-      })
-      dispatchSocialMessage(msg.fromId, fallbackContent).catch(err => console.warn('[social] fallback send failed:', err.message))
-      insertConversation({
-        role: 'jarvis',
-        from_id: 'jarvis',
-        to_id: msg.fromId,
-        content: fallbackContent,
-        timestamp,
-      })
+      deliverFallbackReply(msg, fallbackContent, timestamp)
       toolCallLog.push({
         name: 'send_message',
         args: { target_id: msg.fromId, content: fallbackContent },

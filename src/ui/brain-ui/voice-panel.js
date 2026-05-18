@@ -635,6 +635,63 @@ export function initVoicePanel({
     }
   }
 
+  // PTT（按住空格说话）：press → 开 mic / 从 TTS 恢复，release → 立即发送
+  let pttStartedMic = false;
+
+  async function pttStart() {
+    // 让 release 时不会发出旧的累积识别结果
+    lastTranscriptText = '';
+    if (autoSendTimer) { clearTimeout(autoSendTimer); autoSendTimer = null; }
+
+    if (suspendedByMedia) {
+      // mic 硬件仍在，只是 ASR WS 被 TTS 暂停 → 重连即可，不算 PTT 开的 mic
+      pttStartedMic = false;
+      await resumeVoiceInputFromMedia(false);
+      return;
+    }
+    if (micActive) {
+      // 已经在听 → 不改状态，但 release 时仍要"立即发送"
+      pttStartedMic = false;
+      return;
+    }
+    pttStartedMic = true;
+    await toggleVoice();
+  }
+
+  function pttEnd() {
+    const startedMic = pttStartedMic;
+    pttStartedMic = false;
+    if (!micActive) return;
+
+    // 通知云端 ASR 立刻给最终结果
+    try {
+      if (cloudWs && cloudWs.readyState === WebSocket.OPEN) {
+        cloudWs.send(JSON.stringify({ type: 'flush' }));
+      }
+    } catch {}
+
+    const finalize = () => {
+      if (lastTranscriptText) {
+        if (autoSendTimer) { clearTimeout(autoSendTimer); autoSendTimer = null; }
+        setStatus('processing');
+        sendRecognizedVoiceText();
+        if (startedMic) setTimeout(() => stopVoiceInput(), 120);
+      } else if (startedMic) {
+        stopVoiceInput();
+      }
+    };
+
+    // 给云端 800ms 把最终结果吐出来
+    let waited = 0;
+    const tick = () => {
+      if (lastTranscriptText) { finalize(); return; }
+      if (waited >= 800) { finalize(); return; }
+      waited += 100;
+      setTimeout(tick, 100);
+    };
+    tick();
+  }
+
   window.bailongmaVoice = {
     isActive: () => micActive,
     // 视频/音乐模式：完全停止 mic（不需要打断能力）
@@ -663,6 +720,8 @@ export function initVoicePanel({
       resumeVoiceInputFromMedia(false);
     },
     stop: () => stopVoiceInput(),
+    pttStart,
+    pttEnd,
   };
 
   window.addEventListener('bailongma:video-mode', (event) => {

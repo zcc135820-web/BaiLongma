@@ -13,9 +13,9 @@ import {
 } from '../db.js'
 import { getActiveUICards } from '../events.js'
 import { getInstalledToolNames } from '../capabilities/marketplace/index.js'
+import { PRIMARY_USER_ID } from '../identity.js'
 
 const L2_CONTEXT_HOURS = 24 * 7
-const PRIMARY_USER_ID = 'ID:000001'
 
 function summarizeUISignals(signals = []) {
   if (!signals.length) return ''
@@ -188,12 +188,16 @@ async function searchRelevantMemories({
   const contextHitsCapped = contextHits.slice(0, contextLimit)
 
   // 向量召回兜底：focusText 算 embedding，找 FTS5 没召回到的 top-N 语义相似记忆，
-  // 追加到 focus 桶末尾。失败/未配置时静默跳过，行为完全等同 FTS5-only。
+  // 追加到 focus 桶末尾。失败/超时/未配置时静默跳过，行为完全等同 FTS5-only。
+  // 注：800ms 硬超时——挡在主 LLM 调用之前，embedding 网络慢一点都会被用户感知为"卡顿"
   let vecAppended = []
   try {
     const { computeEmbedding, isEmbeddingConfigured } = await import('../embedding.js')
     if (isEmbeddingConfigured() && focusText) {
-      const queryEmb = await computeEmbedding(focusText)
+      const queryEmb = await Promise.race([
+        computeEmbedding(focusText),
+        new Promise(resolve => setTimeout(() => resolve(null), 800)),
+      ])
       if (queryEmb) {
         const { searchByEmbedding } = await import('../db.js')
         const vecHits = searchByEmbedding(queryEmb, Math.min(focusLimit, 10))

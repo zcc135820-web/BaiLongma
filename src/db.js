@@ -44,6 +44,8 @@ function initSchema() {
   try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_mem_id ON memories(mem_id) WHERE mem_id IS NOT NULL`) } catch {}
   // 迁移：conversations 加 channel 列
   try { db.exec(`ALTER TABLE conversations ADD COLUMN channel TEXT DEFAULT ''`) } catch {}
+  // 迁移：conversations 加 external_party_id 列（保留外部渠道原始 ID，供回送投递）
+  try { db.exec(`ALTER TABLE conversations ADD COLUMN external_party_id TEXT DEFAULT ''`) } catch {}
 
   // 迁移：FTS5 tokenizer 从默认 unicode61 升级到 trigram。
   // 默认 tokenizer 把中文整段当成一个 token（"咖啡偏好"被存为一个整体），
@@ -93,6 +95,7 @@ function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_conv_from_id   ON conversations(from_id);
   `)
   try { db.exec(`ALTER TABLE conversations ADD COLUMN channel TEXT DEFAULT ''`) } catch {}
+  try { db.exec(`ALTER TABLE conversations ADD COLUMN external_party_id TEXT DEFAULT ''`) } catch {}
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS memories (
@@ -302,6 +305,52 @@ function initSchema() {
   // 老库迁移：补上文档字段
   try { db.exec(`ALTER TABLE known_agents ADD COLUMN docs_url TEXT`) } catch {}
   try { db.exec(`ALTER TABLE known_agents ADD COLUMN docs_search_query TEXT`) } catch {}
+
+  // user_identities 表：渠道外部 ID → canonical 用户 ID 的绑定（多用户阶段使用，单用户阶段保留为空）
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_identities (
+      canonical_id TEXT NOT NULL,
+      channel      TEXT NOT NULL,
+      external_id  TEXT NOT NULL,
+      alias        TEXT DEFAULT '',
+      bound_at     TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (channel, external_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_identity_canonical ON user_identities(canonical_id);
+  `)
+
+  // 一次性历史数据迁移：把外部前缀 ID 统一为 PRIMARY_USER_ID，原值搬到 external_party_id
+  try {
+    const flag = db.prepare(`SELECT value FROM config WHERE key = ?`).get('migration_canonical_user_v1')
+    if (!flag) {
+      const externalRows = db.prepare(`
+        SELECT COUNT(*) AS c FROM conversations
+        WHERE from_id LIKE 'wechat:%' OR from_id LIKE 'discord:%'
+           OR from_id LIKE 'feishu:%' OR from_id LIKE 'wecom:%'
+           OR to_id   LIKE 'wechat:%' OR to_id   LIKE 'discord:%'
+           OR to_id   LIKE 'feishu:%' OR to_id   LIKE 'wecom:%'
+      `).get()
+      if (externalRows.c > 0) {
+        console.log(`[DB migration] Canonicalizing ${externalRows.c} conversation row(s) with external-channel IDs → ID:000001`)
+        db.exec(`
+          UPDATE conversations
+            SET external_party_id = CASE WHEN external_party_id = '' OR external_party_id IS NULL THEN from_id ELSE external_party_id END,
+                from_id = 'ID:000001'
+            WHERE from_id LIKE 'wechat:%' OR from_id LIKE 'discord:%'
+               OR from_id LIKE 'feishu:%' OR from_id LIKE 'wecom:%';
+          UPDATE conversations
+            SET external_party_id = CASE WHEN external_party_id = '' OR external_party_id IS NULL THEN to_id ELSE external_party_id END,
+                to_id = 'ID:000001'
+            WHERE to_id LIKE 'wechat:%' OR to_id LIKE 'discord:%'
+               OR to_id LIKE 'feishu:%' OR to_id LIKE 'wecom:%';
+        `)
+      }
+      db.prepare(`INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?, ?, datetime('now'))`)
+        .run('migration_canonical_user_v1', new Date().toISOString())
+    }
+  } catch (err) {
+    console.warn('[DB migration] canonical user migration failed:', err.message)
+  }
 
   // 重建 FTS 索引（覆盖已有数据，确保历史记忆也被索引）
   db.exec(`INSERT INTO memories_fts(memories_fts) VALUES('rebuild')`)
@@ -1014,14 +1063,14 @@ export function getImpressiveBySource(entityId, limit = 5) {
 // ── 对话记录 ──
 
 // 写入一条对话记录
-export function insertConversation({ role, from_id, to_id = null, content, timestamp, channel = '' }) {
+export function insertConversation({ role, from_id, to_id = null, content, timestamp, channel = '', external_party_id = '' }) {
   const db = getDB()
   const fromId = normalizeConversationPartyId(from_id)
   const toId = normalizeConversationPartyId(to_id)
   db.prepare(`
-    INSERT INTO conversations (role, from_id, to_id, content, timestamp, channel)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(role, fromId, toId, content, timestamp, channel || '')
+    INSERT INTO conversations (role, from_id, to_id, content, timestamp, channel, external_party_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(role, fromId, toId, content, timestamp, channel || '', external_party_id || '')
 }
 
 // 将最近一条 jarvis 消息内容裁剪为已说出的部分（TTS 被打断时调用）

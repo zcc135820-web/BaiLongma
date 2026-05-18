@@ -322,7 +322,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       const db = getDB()
       const limit = Math.min(parseInt(url.searchParams.get('limit') || '60'), 500)
       const rows = db.prepare(`
-        SELECT id, role, from_id, to_id, content, timestamp
+        SELECT id, role, from_id, to_id, content, timestamp, channel, external_party_id
         FROM conversations
         ORDER BY id DESC
         LIMIT ?

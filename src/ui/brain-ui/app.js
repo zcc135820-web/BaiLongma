@@ -1,7 +1,7 @@
 ﻿import { renderBrainUiApp } from "./app-shell.js";
 import { API } from "./api-client.js";
 import { bootstrapACUI } from "./acui/bootstrap.js";
-import { initChat } from "./chat.js";
+import { initChat, friendlyChannelLabel } from "./chat.js";
 import { initPanelCollapse } from "./panel-collapse.js";
 import { ThoughtStream } from "./thought-stream.js";
 import { initVoicePanel } from "./voice-panel.js";
@@ -1069,7 +1069,7 @@ function addNewNodes(memories) {
   const nodeMap = new Map(nodeData.map(n => [n._nid, n]));
   const newNids = [];
   memories.forEach(memory => {
-    const nid = memory.id || memory.mem_id;
+    const nid = memory.mem_id || memory.id;
     if (!nid || nodeMap.has(String(nid))) return;
     const anchor = findAnchorNode(memory, nodeMap);
     const anchorX = anchor?.x ?? W / 2;
@@ -1190,16 +1190,22 @@ function handle({ type, data = {} }) {
   switch (type) {
     case "message_received": {
       currentPath = "l1";
+      L1.beginRound();
       const parsed = parseUserMessageInput(data.input);
       L1.newLine("user message received", {
         content: parsed.content,
         time: parsed.time || undefined,
       });
+      // Immediately show a "thinking" indicator so the gap between message_received
+      // and the first stream_start (injector + LLM TTFT, often 3–30s) doesn't look frozen.
+      L1.startThinkingSession();
       break;
     }
     case "tick":
       currentPath = "l2";
+      L2.beginRound();
       L2.newLine("heartbeat tick");
+      L2.startThinkingSession();
       break;
     case "stream_start":
       currentStream().startThinkingSession();
@@ -1255,16 +1261,25 @@ function handle({ type, data = {} }) {
     case "message":
       if (data.from === "consciousness") {
         lastJarvisContent = data.content;
-        addMsg("jarvis", data.content);
+        const viaLabel = friendlyChannelLabel(data.channel);
+        const content = viaLabel ? `_→ ${viaLabel}_  \n${data.content}` : data.content;
+        addMsg("jarvis", content);
         openChat(true);
       }
       break;
-    case "message_in":
-      if (data.from_id && data.from_id !== "ID:000001") {
-        addMsg("external", data.content, { label: data.from_id, alert: false });
+    case "message_in": {
+      // 外部渠道判定：channel 非空且非本地，或 from_id 仍带外部前缀（兼容连接器直接 emit 的事件）
+      const ch = String(data.channel || "").toUpperCase();
+      const isExternal =
+        (ch && ch !== "TUI" && ch !== "API" && ch !== "SYSTEM" && ch !== "REMINDER" && ch !== "APP_SIGNAL" && ch !== "VOICE" && ch !== "语音识别")
+        || (data.from_id && /^(wechat|discord|feishu|wecom):/i.test(data.from_id));
+      if (isExternal) {
+        const label = friendlyChannelLabel(data.channel) || data.from_id || "External";
+        addMsg("external", data.content, { label, alert: false });
         openChat(true);
       }
       break;
+    }
     case "agent_name_updated":
       setAgentName(data.name);
       break;
@@ -2997,6 +3012,42 @@ initHotspot().catch((err) => console.warn('[Hotspot] init failed:', err));
 
   window.bailongmaMedia = { handle: handleMediaCommand, showVideo, controlVideo, showImage, showCamera, showMusic, controlMusic };
   window.addEventListener("bailongma:media", (event) => handleMediaCommand(event.detail || {}));
+
+  // Push-to-talk：按住空格说话；Agent 正在说话时按下空格直接打断
+  (() => {
+    let pttHeld = false;
+    const isSpace = (e) => e.code === "Space" || e.key === " " || e.key === "Spacebar";
+    const isTypingTarget = (t) =>
+      !!t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+
+    window.addEventListener("keydown", (e) => {
+      if (!isSpace(e)) return;
+      if (isTypingTarget(e.target)) return;
+      if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+      e.preventDefault();
+      if (e.repeat) return;
+      if (pttHeld) return;
+      pttHeld = true;
+      // 不论是否在播，stopTTS 内部已做 no-op 守卫
+      try { window.stopTTS?.(); } catch {}
+      window.bailongmaVoice?.pttStart?.();
+    }, { capture: true });
+
+    window.addEventListener("keyup", (e) => {
+      if (!isSpace(e)) return;
+      if (!pttHeld) return;
+      pttHeld = false;
+      e.preventDefault();
+      window.bailongmaVoice?.pttEnd?.();
+    }, { capture: true });
+
+    // 切到后台时如果还按着，强制释放，避免 mic 永远不关
+    window.addEventListener("blur", () => {
+      if (!pttHeld) return;
+      pttHeld = false;
+      window.bailongmaVoice?.pttEnd?.();
+    });
+  })();
 
   videoBtn?.addEventListener("click", toggleVideoPanelVisibility);
   videoExitBtn?.addEventListener("click", closeAndDestroyVideo);

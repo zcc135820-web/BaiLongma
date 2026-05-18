@@ -1,5 +1,16 @@
 import { createMarkdownBody } from "./markdown.js";
 
+// 把数据库/事件里的细粒度 channel 名转成 UI 友好的简化标签
+export function friendlyChannelLabel(channel) {
+  if (!channel) return "";
+  const c = String(channel).toUpperCase();
+  if (c === "WECHAT_CLAWBOT" || c === "WECHAT_OFFICIAL" || c === "WECHAT") return "WeChat";
+  if (c === "WECOM") return "WeCom";
+  if (c === "DISCORD") return "Discord";
+  if (c === "FEISHU") return "Feishu";
+  return "";
+}
+
 export function initChat({
   apiBase,
   maxHistory,
@@ -134,8 +145,15 @@ export function initChat({
       return rows
         .filter(r => r && (r.role === "user" || r.role === "jarvis") && typeof r.content === "string")
         .map(r => {
-          if (r.role === "user" && r.from_id && r.from_id !== "ID:000001") {
-            return { role: "external", text: r.content, label: r.from_id };
+          // 外部渠道判定：channel 非空且不是本地（TUI/API），或 from_id 仍带外部前缀（兼容历史数据）
+          const channel = (r.channel || "").toUpperCase();
+          const isExternal =
+            r.role === "user"
+            && ((channel && channel !== "TUI" && channel !== "API" && channel !== "SYSTEM" && channel !== "REMINDER" && channel !== "APP_SIGNAL" && channel !== "VOICE" && channel !== "语音识别")
+                || /^(wechat|discord|feishu|wecom):/i.test(r.from_id || ""));
+          if (isExternal) {
+            const label = friendlyChannelLabel(r.channel) || r.from_id;
+            return { role: "external", text: r.content, label };
           }
           return { role: r.role, text: r.content };
         });

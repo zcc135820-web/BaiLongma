@@ -84,6 +84,16 @@ export function startClawbotConnector({ pushMessage, emitEvent } = {}) {
       },
     }).then(result => {
       currentQrUrl = null
+      // wechat-ilink-client 的 login() 在超时/取消等情况下不会 reject，
+      // 而是 resolve 一个 { connected: false, message } —— 必须显式检查 connected 字段，
+      // 否则会误把超时当成扫码成功，UI 卡在虚假的"已连接"
+      if (!result?.connected || !result?.accountId || !result?.botToken) {
+        clawbotStatus = 'idle'
+        const reason = result?.message || '未知原因'
+        console.warn(`[ClawBot] 扫码登录未完成: ${reason}`)
+        emitEvent?.('social_status', { platform: 'wechat-clawbot', status: 'idle', reason })
+        return
+      }
       clawbotStatus = 'connected'
       setClawbotCredentials({
         accountId: result.accountId,
@@ -104,6 +114,9 @@ export function startClawbotConnector({ pushMessage, emitEvent } = {}) {
     console.log(`[ClawBot] 使用已保存凭证启动（accountId: ${saved.accountId}）`)
     emitEvent?.('social_status', { platform: 'wechat-clawbot', status: 'connected', accountId: saved.accountId })
     client.start().catch(err => {
+      // start 失败说明凭证已失效或后端连不上 —— 必须同步把内存状态打回去，
+      // 否则 popup 查询时仍会拿到 'connected'，UI 显示"已连接"但实际啥都不通
+      clawbotStatus = 'error'
       console.error(`[ClawBot] start 失败: ${err.message}`)
       emitEvent?.('social_status', { platform: 'wechat-clawbot', status: 'error', error: err.message })
     })

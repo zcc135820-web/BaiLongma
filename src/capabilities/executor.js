@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url'
 import { spawn } from 'child_process'
 import { chromium } from 'playwright'
 import { nowTimestamp } from '../time.js'
-import { searchMemories, searchMemoriesByKeywords, insertMemory, upsertMemoryByMemId, memoryExistsByMemId, getMemoryByMemId, deleteMemoryByMemId, normalizeConversationPartyId, createReminder, findMergeableOneOffReminder, appendReminderTask, listPendingReminders, getReminderById, cancelReminder, upsertPrefetchTask, removePrefetchTask, listPrefetchTasks, insertActionLog, upsertMusicTrack, getMusicTrack, searchMusicLibrary, listMusicLibrary, updateMusicLrc, deleteMusicTrack as dbDeleteMusicTrack, setConfig as dbSetConfig } from '../db.js'
+import { searchMemories, searchMemoriesByKeywords, insertMemory, upsertMemoryByMemId, memoryExistsByMemId, getMemoryByMemId, deleteMemoryByMemId, normalizeConversationPartyId, createReminder, findMergeableOneOffReminder, appendReminderTask, listPendingReminders, getReminderById, cancelReminder, upsertPrefetchTask, removePrefetchTask, listPrefetchTasks, insertActionLog, insertConversation, upsertMusicTrack, getMusicTrack, searchMusicLibrary, listMusicLibrary, updateMusicLrc, deleteMusicTrack as dbDeleteMusicTrack, setConfig as dbSetConfig } from '../db.js'
 import { emitEvent, emitUICommand, emitACUIEvent, hasACUIClient, addActiveUICard, removeActiveUICard, getActiveUICards } from '../events.js'
 import { dispatchSocialMessage } from '../social/dispatch.js'
 import { callCapability, listCapabilities } from '../providers/registry.js'
@@ -48,6 +48,7 @@ function getUrlTtl(url) {
 import { config, getTTSCredentials, setSecurity } from '../config.js'
 import { streamTTS } from '../voice/tts-providers.js'
 import { paths } from '../paths.js'
+import { PRIMARY_USER_ID, lookupReplyTarget, normalizeChannel, suggestProactiveChannel } from '../identity.js'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // 文件操作只允许在 sandbox 目录内
 const SANDBOX_ROOT = path.resolve(paths.sandboxDir)
@@ -557,20 +558,80 @@ function trimAssistantFluff(content) {
 }
 
 // express：表达器入口，根据 format 路由到对应输出渠道
-async function execExpress({ target_id, content, format = 'text' }, context = {}) {
+async function execExpress({ target_id, content, channel = 'AUTO', format = 'text' }, context = {}) {
   if (!content?.trim()) return '错误：未提供表达内容'
   if (format === 'voice') {
     // 语音表达：先发文字消息再生成语音
-    const sendResult = await execSendMessage({ target_id, content }, context)
+    const sendResult = await execSendMessage({ target_id, content, channel }, context)
     if (sendResult.startsWith('错误：') || sendResult.startsWith('执行失败：')) return sendResult
     return await execSpeak({ text: content })
   }
   // 默认：文字表达
-  return await execSendMessage({ target_id, content }, context)
+  return await execSendMessage({ target_id, content, channel }, context)
 }
 
-// send_message：推送到 SSE 流，所有订阅者实时收到
-async function execSendMessage({ target_id, content }, context = {}) {
+// 决议出站消息的真实投递目标：
+// 输入 target_id（可能是 canonical ID:000001 或带前缀的外部 ID）+ channel 偏好（WECHAT/DISCORD/FEISHU/WECOM/TUI/AUTO）+ ctx
+// 输出 { externalTargetId, deliveryChannel, isLocal, reason }
+//   - externalTargetId: 传给 dispatchSocialMessage 的 ID（本地投递时为 null）
+//   - deliveryChannel: conversations.channel 字段实际值（数据库格式，如 WECHAT_CLAWBOT/TUI）
+//   - isLocal: true 时不调外部 dispatch，只走本地 SSE
+//   - reason: 失败时给 LLM 的提示
+// AUTO 决议顺序：当前 turn 渠道（响应模式）→ suggestProactiveChannel（主动模式）
+function resolveDeliveryTarget(resolvedId, channelPref, context = {}) {
+  const pref = (channelPref || 'AUTO').toUpperCase()
+
+  // resolvedId 本身就是带渠道前缀的外部 ID（少见，但保留兼容）—— 直接当外部投递
+  if (/^(wechat|discord|feishu|wecom):/i.test(resolvedId)) {
+    return { externalTargetId: resolvedId, deliveryChannel: '', isLocal: false }
+  }
+
+  // canonical 用户 ID：根据 channel 偏好决议
+  let actualPref = pref
+  if (actualPref === 'AUTO') {
+    // 优先用当前 turn 的渠道：用户在哪儿发消息就回到哪儿（响应直觉一致）
+    const currentNorm = context.currentChannel ? normalizeChannel(context.currentChannel) : null
+    if (currentNorm && currentNorm !== 'SYSTEM') {
+      actualPref = currentNorm
+    } else {
+      // 没有当前 turn 渠道（典型场景：tick 主动外联）→ 用 presence 推荐
+      actualPref = suggestProactiveChannel(resolvedId)
+    }
+  }
+
+  if (actualPref === 'TUI') {
+    return { externalTargetId: null, deliveryChannel: 'TUI', isLocal: true }
+  }
+
+  // 当前 turn 已经在该外部渠道、且带 externalPartyId → 直接复用，省一次 DB 查
+  if (context.currentExternalPartyId && context.currentChannel) {
+    const ctxNorm = normalizeChannel(context.currentChannel)
+    if (ctxNorm === actualPref) {
+      return {
+        externalTargetId: context.currentExternalPartyId,
+        deliveryChannel: context.currentChannel,
+        isLocal: false,
+      }
+    }
+  }
+
+  // 否则反查该 canonical 用户在指定渠道最近一次的 external_id
+  const reply = lookupReplyTarget({ canonicalId: resolvedId, channel: actualPref })
+  if (reply) {
+    return { externalTargetId: reply.externalId, deliveryChannel: reply.channel, isLocal: false }
+  }
+
+  // 用户在该渠道从未交互过，无法主动联系
+  return {
+    externalTargetId: null,
+    deliveryChannel: '',
+    isLocal: false,
+    error: `cannot route to ${actualPref}: user ${resolvedId} has no recorded external_party_id on that channel`,
+  }
+}
+
+// send_message：投递到指定渠道（本地 SSE 或外部平台），并写入 conversations 表
+async function execSendMessage({ target_id, content, channel = 'AUTO' }, context = {}) {
   if (!target_id) return '错误：未提供 target_id'
   if (!content?.trim()) return '错误：未提供消息内容'
 
@@ -579,15 +640,50 @@ async function execSendMessage({ target_id, content }, context = {}) {
   const cleanedContent = trimAssistantFluff(content)
   if (!cleanedContent) return '错误：消息内容为空'
 
+  const delivery = resolveDeliveryTarget(resolvedId, channel, context)
+  if (delivery.error) return `错误：${delivery.error}`
+
   const timestamp = nowTimestamp()
-  console.log(`\n[消息发送] → ${resolvedId}`)
+  const channelLabel = delivery.deliveryChannel || (delivery.isLocal ? 'TUI' : '')
+  console.log(`\n[消息发送] → ${resolvedId}${delivery.externalTargetId ? ` via ${delivery.externalTargetId}` : ''}${channelLabel ? ` [${channelLabel}]` : ''}`)
   console.log(`  ${cleanedContent}`)
   console.log(`  时间：${timestamp}`)
-  emitEvent('message', { from: 'consciousness', to: resolvedId, content: cleanedContent, timestamp })
-  const socialResult = await dispatchSocialMessage(resolvedId, cleanedContent)
+
+  // 顺序：先写数据库（source of truth），再广播 SSE，最后外部投递。
+  // 外部投递失败时仍保留对话记录，下次 LLM 仍能看到自己发过这句话；前端也已经显示。
+  insertConversation({
+    role: 'jarvis',
+    from_id: 'jarvis',
+    to_id: resolvedId,
+    content: cleanedContent,
+    timestamp,
+    channel: channelLabel,
+    external_party_id: delivery.externalTargetId || '',
+  })
+
+  emitEvent('message', {
+    from: 'consciousness',
+    to: resolvedId,
+    content: cleanedContent,
+    timestamp,
+    channel: channelLabel,
+    external_party_id: delivery.externalTargetId || '',
+  })
+
+  let socialResult = null
+  if (!delivery.isLocal && delivery.externalTargetId) {
+    try {
+      socialResult = await dispatchSocialMessage(delivery.externalTargetId, cleanedContent)
+    } catch (err) {
+      console.warn(`[消息发送] 外部投递异常 (${delivery.deliveryChannel}): ${err.message}`)
+      socialResult = { ok: false, error: err.message }
+    }
+  }
+
   if (socialResult?.ok) return `消息已发送至 ${resolvedId}（${socialResult.platform} 已投递）`
   if (socialResult?.skipped) return `消息已发送至 ${resolvedId}（社交平台未配置：${socialResult.reason}）`
-  return `消息已发送至 ${resolvedId}`
+  if (socialResult && socialResult.ok === false) return `消息已尝试投递至 ${resolvedId}，但外部渠道失败：${socialResult.reason || socialResult.error || 'unknown'}`
+  return `消息已发送至 ${resolvedId}${channelLabel ? `（${channelLabel}）` : ''}`
 }
 
 function parseHourMinute(value, label = 'time') {
@@ -690,7 +786,7 @@ async function execManageReminder(args, context = {}) {
   const { task } = args
   if (!task?.trim()) return '错误：未提供 task'
   const taskText = task.trim()
-  const fallbackTargetId = context.visibleTargetIds?.[0] || context.allowedTargetIds?.[0] || 'ID:000001'
+  const fallbackTargetId = context.visibleTargetIds?.[0] || context.allowedTargetIds?.[0] || PRIMARY_USER_ID
   const resolvedTargetId = resolveAllowedTargetId(args.target_id || fallbackTargetId, context.allowedTargetIds)
 
   const kind = args.kind || 'once'

@@ -1,5 +1,6 @@
 import { nowTimestamp } from './time.js'
 import { normalizeConversationPartyId, upsertEntity, insertConversation } from './db.js'
+import { resolveCanonicalUserId } from './identity.js'
 
 // 分级内存消息队列：用户消息永远优先于后台消息（提醒、系统消息等）
 const queues = {
@@ -33,27 +34,39 @@ function resolveQueueName(priority, meta = {}) {
 function pruneSupersededUserMessages(entry) {
   if (!entry || entry.queueName !== 'user') return
 
+  // 按 (fromId, channel) 联合 key 去重：避免同一用户跨渠道时一个吞掉另一个
   for (let i = queues.user.length - 1; i >= 0; i--) {
     const pending = queues.user[i]
     if (!pending) continue
     if (pending.fromId !== entry.fromId) continue
+    if ((pending.channel || '') !== (entry.channel || '')) continue
     queues.user.splice(i, 1)
   }
 }
 
-export function pushMessage(fromId, content, channel = 'TUI', meta = {}) {
-  const normalizedFromId = normalizeConversationPartyId(fromId)
+export function pushMessage(rawFromId, content, channel = 'TUI', meta = {}) {
+  const normalizedRaw = normalizeConversationPartyId(rawFromId)
+  const canonicalId = resolveCanonicalUserId({ rawFromId: normalizedRaw, channel })
+  const externalPartyId = canonicalId !== normalizedRaw ? normalizedRaw : ''
   const timestamp = nowTimestamp()
-  const priority = resolvePriority(normalizedFromId, channel, meta)
+  const priority = resolvePriority(canonicalId, channel, meta)
   const queueName = resolveQueueName(priority, meta)
-  upsertEntity(normalizedFromId)
+  upsertEntity(canonicalId)
   // 消息一到就写入聊天记录（微信式：打开即可见所有未处理消息）。
   // 若随后 LLM 处理被新消息打断，本条仍然保留在 conversations 表中，
   // 下一轮处理最新消息时通过 conversationWindow 自动作为上下文可见。
-  insertConversation({ role: 'user', from_id: normalizedFromId, content, timestamp, channel: channel || '' })
+  insertConversation({
+    role: 'user',
+    from_id: canonicalId,
+    content,
+    timestamp,
+    channel: channel || '',
+    external_party_id: externalPartyId,
+  })
   const entry = {
-    raw: `[${normalizedFromId}] ${timestamp} [${channel}] ${content}`,
-    fromId: normalizedFromId,
+    raw: `[${canonicalId}${externalPartyId ? ` via ${externalPartyId}` : ''}] ${timestamp} [${channel}] ${content}`,
+    fromId: canonicalId,
+    externalPartyId,
     content,
     timestamp,
     channel,
