@@ -283,6 +283,7 @@ export function buildContextBlock({
   awakeningTicks = 0,
   roundInfo = null,
   focusFrame = null,
+  focusStack = null,
   focusTickCounter = 0,
 } = {}) {
   const sections = []
@@ -329,20 +330,64 @@ There is no active current_task. Default to quiet presence, but do not treat qui
 </task>`)
   }
 
-  // <focus> —— 注意力焦点感知信号（非命令）
+  // <focus> + <focus-history> —— 注意力焦点感知信号（非命令）
+  //
   // 焦点是连续判断的副产品：让模型「知道自己在关注什么」，但用户一旦换话题就立刻松手。
-  if (focusFrame && Array.isArray(focusFrame.topic) && focusFrame.topic.length > 0) {
-    const topicAttr = focusFrame.topic.join(', ')
-    const since = Math.max(0, (focusTickCounter || 0) - (focusFrame.startedAtTick || 0))
-    const idle = Math.max(0, (focusTickCounter || 0) - (focusFrame.lastSeenTick || 0))
-    const ageDesc = (focusFrame.hitCount || 0) <= 1
-      ? 'just started focusing on this'
-      : (idle === 0
-          ? `${since} rounds since first seen, last seen this round`
-          : `${since} rounds since first seen, last seen ${idle} rounds ago`)
-    sections.push(`<focus topic="${topicAttr}" age="${ageDesc}">
-You have been focused on this topic across recent turns. Stay aligned with it unless the user clearly pivots — in which case let it go without making a fuss.
-</focus>`)
+  // 多帧栈语义：
+  //   - 栈顶帧 → <focus>（当前主线）
+  //   - 栈下面的帧 → <focus-history>（未完成的背景专注，可能已被压缩回填出结论）
+  //   - 栈顶自己累积的 conclusions（子主题压缩回填上来的）也附在 <focus> 段末尾
+  //
+  // 向后兼容：旧调用点只传 focusFrame 时，把它当作单元素栈处理。
+  const effectiveStack = Array.isArray(focusStack) && focusStack.length > 0
+    ? focusStack
+    : (focusFrame ? [focusFrame] : [])
+
+  if (effectiveStack.length > 0) {
+    const topIdx = effectiveStack.length - 1
+    const top = effectiveStack[topIdx]
+    if (top && Array.isArray(top.topic) && top.topic.length > 0) {
+      const topicAttr = top.topic.join(', ')
+      const since = Math.max(0, (focusTickCounter || 0) - (top.startedAtTick || 0))
+      const idle = Math.max(0, (focusTickCounter || 0) - (top.lastSeenTick || 0))
+      const ageDesc = (top.hitCount || 0) <= 1
+        ? 'just started focusing on this'
+        : (idle === 0
+            ? `${since} rounds since first seen, last seen this round`
+            : `${since} rounds since first seen, last seen ${idle} rounds ago`)
+      let focusBody = `You are currently focused on this topic. Stay aligned with it unless the user clearly pivots — in which case let it go without making a fuss.`
+      // 栈顶自己的 conclusions：子主题压缩回填上来的「沉淀」
+      if (Array.isArray(top.conclusions) && top.conclusions.length > 0) {
+        const lines = top.conclusions.map(c => `- ${c}`).join('\n')
+        focusBody += `\n\nRecent sub-focus conclusions (already absorbed, do not re-derive):\n${lines}`
+      }
+      sections.push(`<focus topic="${topicAttr}" age="${ageDesc}">\n${focusBody}\n</focus>`)
+    }
+
+    // 栈下面的帧 → <focus-history>：未完成的背景专注
+    if (effectiveStack.length > 1) {
+      const historyLines = []
+      // 从栈底到栈顶下方（不含栈顶），让最早的专注出现在最前
+      for (let i = 0; i < topIdx; i++) {
+        const f = effectiveStack[i]
+        if (!f || !Array.isArray(f.topic) || f.topic.length === 0) continue
+        const topicJoined = f.topic.join(', ')
+        const lastConclusion = Array.isArray(f.conclusions) && f.conclusions.length > 0
+          ? f.conclusions[f.conclusions.length - 1]
+          : null
+        historyLines.push(
+          lastConclusion
+            ? `- "${topicJoined}" — Last conclusion: ${lastConclusion}`
+            : `- "${topicJoined}" — (no conclusion yet)`
+        )
+      }
+      if (historyLines.length > 0) {
+        sections.push(`<focus-history>
+You also have unfinished background focuses you walked away from:
+${historyLines.join('\n')}
+</focus-history>`)
+      }
+    }
   }
 
   if (taskKnowledge) {
