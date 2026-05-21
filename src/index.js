@@ -2,7 +2,7 @@ import { config, getMinimaxKey as _getMinimaxKey, getSecurity } from './config.j
 import { callLLM } from './llm.js'
 import { buildSystemPrompt, buildContextBlock, combinePromptForPreview } from './prompt.js'
 import { runRecognizer } from './memory/recognizer.js'
-import { runInjector, formatMemoriesForPrompt, formatTaskKnowledge, formatPrefetchedItems, formatActiveUICards } from './memory/injector.js'
+import { runInjector, formatMemoriesForPrompt, formatTaskKnowledge, formatPrefetchedItems, formatActiveUICards, formatTemporalRecall } from './memory/injector.js'
 import { updateFocusFrame } from './memory/focus.js'
 import { compressPoppedFrame } from './memory/focus-compress.js'
 import { runMemoryRefreshLoop } from './memory/refresh-loop.js'
@@ -436,7 +436,7 @@ function buildToolContextForProcess(msg, injection) {
   }
 }
 
-function formatConversationMessage(row, currentMsg = null) {
+function formatConversationMessage(row, currentMsg = null, prevChannel = '') {
   if (row.role === 'jarvis') {
     // Jarvis 出站的渠道也标出来，让模型能"看到"自己上次回到了哪里
     const rawChannel = row.channel || ''
@@ -470,7 +470,14 @@ function formatConversationMessage(row, currentMsg = null) {
     && row.content === currentMsg.content
   const marker = isCurrent ? 'current user message' : 'user message'
   // 简化后的渠道：TUI 视为默认不显示；其他（WECHAT/DISCORD/FEISHU/WECOM）显示
-  const channelLabel = (normalizedChannel && normalizedChannel !== 'TUI') ? ` · ${normalizedChannel}` : ''
+  let channelLabel = (normalizedChannel && normalizedChannel !== 'TUI') ? ` · ${normalizedChannel}` : ''
+
+  // channel 切换提示：本条消息相对上一条的入口换了，给模型一个显眼的指代锚点。
+  // 主要场景：用户在 TUI 聊到一半切到微信继续问"那现在呢？"——必须让 LLM 知道
+  // 入口变了、感知能力也跟着变了，否则代词会被 runtime 块（电池/系统块）抢走。
+  if (prevChannel && normalizedChannel && prevChannel !== normalizedChannel) {
+    channelLabel += ` (channel switch: ${prevChannel} → ${normalizedChannel})`
+  }
 
   return {
     role: 'user',
@@ -541,10 +548,15 @@ function buildLLMMessages({ systemPrompt, contextBlock = '', conversationWindow 
   // matched row from conversationWindow (when msg is already persisted to db) or
   // the appended fallback message below (TICK / unmatched cases).
   let currentMessageIndex = -1
+  // prevChannel 维护：上一条非 SYSTEM 消息的 normalized channel，用于在 marker
+  // 上标注 channel switch（"那现在呢"代词消解所依赖的核心信号之一）。
+  let prevChannel = ''
 
   for (const row of rows) {
     if (!row?.content) continue
-    const formatted = formatConversationMessage(row, msg)
+    const rowNorm = normalizeChannel(row.channel || '')
+    const isSystemRow = row.from_id === 'SYSTEM' || rowNorm === 'SYSTEM' || row.channel === 'APP_SIGNAL' || row.channel === 'REMINDER'
+    const formatted = formatConversationMessage(row, msg, isSystemRow ? '' : prevChannel)
     if (!formatted.content) continue
     messages.push(formatted)
     const isCurrent = !!msg
@@ -553,6 +565,7 @@ function buildLLMMessages({ systemPrompt, contextBlock = '', conversationWindow 
       && row.timestamp === msg.timestamp
       && row.content === msg.content
     if (isCurrent) currentMessageIndex = messages.length - 1
+    if (!isSystemRow && rowNorm) prevChannel = rowNorm
   }
 
   const hasCurrentMessage = currentMessageIndex >= 0
@@ -681,6 +694,29 @@ function handleLLMFailure(err, label, msg) {
       emitEvent('message_dropped', { fromId: msg.fromId, retryCount: nextRetry - 1, reason: err.message })
     }
   }
+}
+
+// 判断本轮消息相对历史是否发生了 channel 切换（如 TUI → WECHAT）。
+// 用于给 LLM 显式提示"入口换了"，避免"那现在呢"这类追问被 runtime 块（电量等）抢走代词。
+function detectChannelSwitch(msg, conversationWindow) {
+  if (!msg) return false
+  const currentNorm = normalizeChannel(msg.channel || '')
+  if (!currentNorm) return false
+  const rows = Array.isArray(conversationWindow) ? conversationWindow : []
+  // 倒序找最近一条不是 current 本身、不是 SYSTEM 的消息
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i]
+    if (!row) continue
+    const isSelf = row.role === 'user'
+      && row.from_id === msg.fromId
+      && row.timestamp === msg.timestamp
+      && row.content === msg.content
+    if (isSelf) continue
+    const prevNorm = normalizeChannel(row.channel || '')
+    if (!prevNorm || prevNorm === 'SYSTEM') continue
+    return prevNorm !== currentNorm
+  }
+  return false
 }
 
 // Build systemEnv on demand: inject each block based on keywords in the message
@@ -840,6 +876,7 @@ async function process(input, label, msg = null) {
             `- Search the web for something the user cares about and push valuable findings\n` +
             `- Check task progress or prefetched data (weather/news) and proactively report changes\n` +
             `Guidelines:\n` +
+            `- **Cooldown — strongest rule.** Look at the recent conversation timeline. If your own last send_message is less than 30 minutes old AND the user has not replied since, the default action is silence. Do NOT call send_message. Do not restart a topic the user just walked away from, do not "follow up" on a question you already asked, do not pivot to a stale earlier topic just because the new one didn't get a response. The only carve-outs: a real new fact arrived (reminder fires, a tool you were running just finished with a result the user asked for, a scheduled action's time came up). Boredom, curiosity, and "maybe they'd want to know" are not carve-outs.\n` +
             `- Proactive but not intrusive: don't repeat what was just said; don't bother late at night without reason (23:00–06:00: only message when there is clear value)\n` +
             `- Have substance: before sending, make sure there is something genuinely worth saying — not just "checking in"\n` +
             `- One thing per tick: pick the most valuable action, do it, and stop — don't pile multiple actions into one tick\n` +
@@ -861,6 +898,7 @@ async function process(input, label, msg = null) {
     const memoriesText = formatMemoriesForPrompt(injection.memories, injection.recallMemories)
     const directionsText = directions.join('\n')
     const taskKnowledgeText = formatTaskKnowledge(injection.taskKnowledge)
+    const temporalRecallText = formatTemporalRecall(injection.temporalRecall)
 
     // Real-time user messages take the fast path: skip heavy context gathering to avoid slowdowns from task background.
     const prefetchText = formatPrefetchedItems(injection.prefetchedItems)
@@ -965,6 +1003,7 @@ async function process(input, label, msg = null) {
 
     const baseContextArgs = {
       memories: memoriesText,
+      temporalRecall: temporalRecallText,
       directions: directionsText,
       constraints: injection.constraints || [],
       personMemory: injection.personMemory || null,
@@ -980,6 +1019,8 @@ async function process(input, label, msg = null) {
       currentTime: nowTimestamp(),
       existenceDesc: describeExistence(birthTime),
       systemEnv: buildSystemEnv(msg),
+      currentChannel: msg ? normalizeChannel(msg.channel || '') : '',
+      channelSwitched: detectChannelSwitch(msg, injection.conversationWindow || []),
       focusTickCounter: state.tickCounter || 0,
     }
     let contextBlock = buildContextBlock(baseContextArgs)
@@ -1076,10 +1117,14 @@ async function process(input, label, msg = null) {
       onRetry: ({ attempt, nextAttempt, maxAttempts, delayMs, error }) => {
         emitEvent('llm_retry', { attempt, nextAttempt, maxAttempts, delayMs, error })
       },
-      onStream: ({ event, mode, text }) => {
+      onToolExecute: (name) => {
+        emitEvent('tool_executing', { name })
+      },
+      onStream: ({ event, mode, text, name }) => {
         if (event === 'start') emitEvent('stream_start', { mode })
         else if (event === 'chunk') emitEvent('stream_chunk', { text })
         else if (event === 'end') emitEvent('stream_end', {})
+        else if (event === 'tool_preparing') emitEvent('tool_preparing', { name })
       },
     })
     throwIfAborted(controller.signal)

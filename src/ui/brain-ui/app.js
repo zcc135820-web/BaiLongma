@@ -36,13 +36,6 @@ const repulsionValue = document.getElementById("repulsion-value");
 const nodeSizeValue = document.getElementById("node-size-value");
 const brandNameEl = document.getElementById("agent-brand-name");
 const graphEl = document.getElementById("graph");
-const checkUpdateBtn = document.getElementById("check-update-btn");
-const downloadUpdateBtn = document.getElementById("download-update-btn");
-const installUpdateBtn = document.getElementById("install-update-btn");
-const ignoreVersionBtn = document.getElementById("ignore-version-btn");
-const updateStatusEl = document.getElementById("update-status");
-const updateCardEl = document.getElementById("update-card");
-const updateCloseBtn = document.getElementById("update-close-btn");
 const focusBlockEl = document.getElementById("focus-block");
 const focusStackEl = document.getElementById("focus-stack");
 const focusDepthEl = document.getElementById("focus-depth");
@@ -51,7 +44,6 @@ const IGNORED_VERSION_KEY = "bailongma_ignored_update_version";
 const SUPPRESS_UPDATES_KEY = "bailongma_suppress_update_notifications";
 
 let agentName = DEFAULT_AGENT_NAME;
-let removeUpdaterStatusListener = null;
 let currentUiZoom = DEFAULT_UI_ZOOM;
 let chat = null;
 
@@ -62,25 +54,6 @@ function isTyping() { return chat?.isTyping() || false; }
 
 function defaultInputPlaceholder() {
   return `Message ${agentName}…`;
-}
-
-function setUpdateStatus(message, state = "idle") {
-  if (!updateStatusEl) return;
-  updateStatusEl.textContent = message;
-  updateStatusEl.dataset.state = state;
-}
-
-function setUpdateCardHidden(hidden) {
-  if (!updateCardEl) return;
-  updateCardEl.classList.toggle("hidden", Boolean(hidden));
-}
-
-function setUpdateButtons({ check = false, checkDisabled = false, checkLabel = "Check for updates", download = false, install = false, ignore = false } = {}) {
-  checkUpdateBtn?.classList.toggle("hidden", !check);
-  if (checkUpdateBtn) { checkUpdateBtn.disabled = checkDisabled; checkUpdateBtn.textContent = checkLabel; }
-  downloadUpdateBtn?.classList.toggle("hidden", !download);
-  installUpdateBtn?.classList.toggle("hidden", !install);
-  ignoreVersionBtn?.classList.toggle("hidden", !ignore);
 }
 
 function clampZoomFactor(factor) {
@@ -198,126 +171,6 @@ requestAnimationFrame(() => {
   resetViewBtn.classList.add("visible");
   physicsControl.classList.add("visible");
 });
-
-async function initUpdaterUi() {
-  if (!updateStatusEl) return;
-
-  const bridge = window.bailongma;
-  if (!bridge?.isElectron) return;
-
-  let pendingVersion = null;
-
-  function isSuppressed() {
-    return localStorage.getItem(SUPPRESS_UPDATES_KEY) === "true";
-  }
-
-  function getIgnoredVersion() {
-    return localStorage.getItem(IGNORED_VERSION_KEY) || null;
-  }
-
-  removeUpdaterStatusListener = bridge.onUpdaterStatus?.((payload = {}) => {
-    const stage = payload.stage || "idle";
-    const ver = payload.version || "";
-    const percent = typeof payload.percent === "number" ? Math.round(payload.percent) : null;
-
-    switch (stage) {
-      case "checking":
-        setUpdateStatus("Checking for updates…", "checking");
-        setUpdateButtons({ check: true, checkDisabled: true, checkLabel: "Checking…" });
-        break;
-
-      case "available":
-        pendingVersion = ver;
-        if (isSuppressed() || (ver && getIgnoredVersion() === ver)) break;
-        setUpdateCardHidden(false);
-        setUpdateStatus(`New version available: ${ver}`, "available");
-        setUpdateButtons({ download: true, ignore: true });
-        break;
-
-      case "downloading":
-        setUpdateCardHidden(false);
-        setUpdateStatus(`Downloading${percent !== null ? ` ${percent}%` : "…"}`, "downloading");
-        setUpdateButtons({});
-        break;
-
-      case "downloaded":
-        setUpdateCardHidden(false);
-        setUpdateStatus(`Version ${ver} ready — will install on restart`, "ready");
-        setUpdateButtons({ install: true });
-        break;
-
-      case "up-to-date":
-        setUpdateStatus(`Already on latest version ${ver}`, "idle");
-        setUpdateButtons({ check: true, checkLabel: "Check for updates" });
-        setUpdateCardHidden(true);
-        break;
-
-      case "error":
-        setUpdateCardHidden(false);
-        setUpdateStatus(`Update error: ${payload.message || "Please try again later"}`, "error");
-        setUpdateButtons({ check: true, checkLabel: "Retry" });
-        break;
-
-      case "dev":
-        setUpdateButtons({ check: true, checkDisabled: true, checkLabel: "Dev mode" });
-        break;
-
-      default:
-        setUpdateButtons({ check: true });
-        break;
-    }
-  }) || null;
-
-  checkUpdateBtn?.addEventListener("click", async () => {
-    setUpdateStatus("Checking for updates…", "checking");
-    setUpdateButtons({ check: true, checkDisabled: true, checkLabel: "Checking…" });
-    try {
-      const result = await bridge.checkForUpdates?.();
-      if (!result?.ok && result?.message) {
-        setUpdateCardHidden(false);
-        setUpdateStatus(`Update error: ${result.message}`, "error");
-        setUpdateButtons({ check: true, checkLabel: "Retry" });
-      }
-    } catch (err) {
-      setUpdateCardHidden(false);
-      setUpdateStatus(`Update error: ${err?.message || "Please try again later"}`, "error");
-      setUpdateButtons({ check: true, checkLabel: "Retry" });
-    }
-  });
-
-  downloadUpdateBtn?.addEventListener("click", async () => {
-    setUpdateStatus("Downloading…", "downloading");
-    setUpdateButtons({});
-    try {
-      await bridge.startDownload?.();
-    } catch (err) {
-      setUpdateCardHidden(false);
-      setUpdateStatus(`Download failed: ${err?.message || "Please try again later"}`, "error");
-      setUpdateButtons({ check: true, checkLabel: "Retry" });
-    }
-  });
-
-  installUpdateBtn?.addEventListener("click", () => {
-    bridge.quitAndInstall?.();
-  });
-
-  ignoreVersionBtn?.addEventListener("click", () => {
-    if (pendingVersion) {
-      localStorage.setItem(IGNORED_VERSION_KEY, pendingVersion);
-      // Sync the settings panel if already mounted
-      const ignoredSection = document.getElementById("settings-ignored-section");
-      const ignoredVal = document.getElementById("settings-ignored-version-val");
-      if (ignoredSection) ignoredSection.style.display = "";
-      if (ignoredVal) ignoredVal.textContent = pendingVersion;
-    }
-    setUpdateCardHidden(true);
-    setUpdateButtons({ check: true });
-  });
-
-  updateCloseBtn?.addEventListener("click", () => {
-    setUpdateCardHidden(true);
-  });
-}
 
 function readCSSVar(name) {
   return getComputedStyle(document.body).getPropertyValue(name).trim();
@@ -1183,46 +1036,37 @@ function truncateConclusion(text, max = 60) {
   return s.slice(0, max - 1).trim() + "…";
 }
 
-function formatFocusTopic(topic) {
-  if (!Array.isArray(topic) || topic.length === 0) return "—";
-  return topic.join(" · ");
-}
-
 function renderFocusFrame(frame, { isTop }) {
-  const topic = formatFocusTopic(frame?.topic);
-  const hits = Number(frame?.hitCount || 0);
   const conclusions = Array.isArray(frame?.conclusions) ? frame.conclusions : [];
 
-  // 新布局：conclusion 为主、topic 为辅。
-  // 主行 = 最近一条 conclusion（数组末尾）；其余早期 conclusion 作为弱化辅助行。
-  // 若没有 conclusion，退回展示 topic 为主 + 「（暂无沉淀结论）」斜体提示。
+  // 主行显示策略（progressive disclosure）：
+  //   1. 有 conclusion → 显示最新一条（这是子帧 pop 时压缩出的 1-2 句话结论）
+  //   2. 无 conclusion 但有 topic → 显示 topic（v0 是 ngram，几百 ms 后被 LLM refine 成人类可读短语）
+  //   3. 都没 → 返回空主行（上层 renderFocusStack 会进一步过滤）
+  // 早期 conclusion 作为弱化辅助行（栈顶帧才显示，避免视觉过载）
   const latest = conclusions.length > 0 ? conclusions[conclusions.length - 1] : "";
   const earlier = conclusions.length > 1 ? conclusions.slice(0, -1) : [];
-
-  const mainHTML = latest
-    ? `<div class="focus-frame-main">${escapeFocusText(truncateConclusion(latest, isTop ? 120 : 80))}</div>`
-    : `<div class="focus-frame-main focus-frame-main-fallback">${escapeFocusText(topic)}` +
-        `<span class="focus-frame-empty-note">（暂无沉淀结论）</span></div>`;
-
-  // 次行：topic ngram。若主行就是 topic（fallback），就不再重复显示。
-  const subHTML = latest
-    ? `<div class="focus-frame-sub">topic: ${escapeFocusText(topic)}</div>`
+  const topicSummary = Array.isArray(frame?.topic) && frame.topic.length > 0
+    ? frame.topic.slice(0, 3).join(" · ")
     : "";
 
-  // 早期 conclusion 用更弱的样式串列在下方，方便回看演化轨迹。
+  let mainHTML = "";
+  if (latest) {
+    mainHTML = `<div class="focus-frame-main">${escapeFocusText(truncateConclusion(latest, isTop ? 120 : 80))}</div>`;
+  } else if (topicSummary) {
+    mainHTML = `<div class="focus-frame-main focus-frame-main-fallback">${escapeFocusText(truncateConclusion(topicSummary, isTop ? 60 : 40))}</div>`;
+  }
+
   const earlierHTML = earlier.map((c) =>
     `<div class="focus-frame-conclusion focus-frame-conclusion-earlier">${escapeFocusText(truncateConclusion(c, isTop ? 100 : 60))}</div>`
   ).join("");
 
-  const meta = isTop
-    ? `命中 ${hits} · 深度 1`
-    : `命中 ${hits}`;
+  // 该帧既无 conclusion 也无 topic（极短暂的"刚 push 还没赋 topic"状态），不渲染外层壳
+  if (!mainHTML && !earlierHTML) return "";
 
   return (
     `<div class="focus-frame${isTop ? " top" : ""}">` +
       mainHTML +
-      subHTML +
-      `<div class="focus-frame-meta">${escapeFocusText(meta)}</div>` +
       earlierHTML +
     `</div>`
   );
@@ -1240,10 +1084,17 @@ function renderFocusStack(stack) {
   }
 
   focusBlockEl.dataset.state = "active";
+  // 渲染策略：只渲染"有 conclusion 的帧 + 栈顶帧"。
+  // 非栈顶 + 无 conclusion 的帧静默隐藏——这种帧是"已 push 但还没 pop"的活帧，
+  // conclusion 永远空着，渲染出来只是占位文字（"…"），堆叠多了视觉很噪。
+  // depth 数字仍然显示真实栈深度，让用户知道还有未压缩的帧挂着。
   // 栈底 → 栈顶；视觉上栈顶在最下（最近一次最强），跟终端 / 思考流方向一致。
-  const html = list.map((frame, i) =>
-    renderFocusFrame(frame, { isTop: i === list.length - 1 })
-  ).join("");
+  const html = list.map((frame, i) => {
+    const isTop = i === list.length - 1;
+    const hasConclusion = Array.isArray(frame?.conclusions) && frame.conclusions.length > 0;
+    if (!isTop && !hasConclusion) return "";
+    return renderFocusFrame(frame, { isTop });
+  }).filter(Boolean).join("");
   focusStackEl.innerHTML = html;
 }
 
@@ -1319,6 +1170,19 @@ function handle({ type, data = {} }) {
     case "stream_end":
       currentStream().stopThinking();
       break;
+    case "tool_preparing": {
+      // 思考动画已停，但工具尚未真正执行 —— 给一个占位状态避免 UI 死寂
+      const stream = currentStream();
+      const label = data.name ? stream.toolLabel(data.name) : "";
+      stream.setStatus(label ? `准备调用 ${label}…` : "准备工具调用…", "busy");
+      break;
+    }
+    case "tool_executing": {
+      const stream = currentStream();
+      const label = data.name ? stream.toolLabel(data.name) : "工具";
+      stream.setStatus(`正在执行 ${label}…`, "busy");
+      break;
+    }
     case "tool_call":
       currentStream().tool(data.name, data.args, data.result, data.ok);
       break;
@@ -1372,28 +1236,14 @@ function handle({ type, data = {} }) {
         if (mainEl) {
           const wasFallback = mainEl.classList.contains("focus-frame-main-fallback");
           if (!wasFallback && mainEl.textContent) {
-            // 把旧主行降级到早期 conclusion 区
             const earlier = document.createElement("div");
             earlier.className = "focus-frame-conclusion focus-frame-conclusion-earlier";
             earlier.textContent = mainEl.textContent;
-            // 插到 meta 之后（即在早期列表区开头/末尾都行，统一放在 meta 之后保持先后顺序）
-            const metaEl = topFrame.querySelector(".focus-frame-meta");
-            if (metaEl && metaEl.nextSibling) {
-              topFrame.insertBefore(earlier, metaEl.nextSibling);
-            } else {
-              topFrame.appendChild(earlier);
-            }
+            topFrame.appendChild(earlier);
           }
           mainEl.classList.remove("focus-frame-main-fallback");
           mainEl.innerHTML = "";
           mainEl.textContent = newText;
-          // 若先前没有 sub 行（fallback 态），现在补一个，给 topic 一个去处
-          if (wasFallback && !topFrame.querySelector(".focus-frame-sub")) {
-            const sub = document.createElement("div");
-            sub.className = "focus-frame-sub";
-            // 从已有 topic 文本里取（fallback 主行里就是 topic 文本，但已被清空，所以
-            // 这一步交给下一次 focus_frame 全量重渲染补齐 sub 行；这里就不强行造）。
-          }
         }
       }
       flashFocusCompressed();
@@ -1756,7 +1606,6 @@ loadAgentProfile();
 initPersonCard();
 initDocPanel().catch((err) => console.warn('[DocPanel] init failed:', err));
 chat.restoreChatHistory();
-initUpdaterUi();
 chat.unlockAudioOnFirstGesture();
 
 bootstrapACUI();
@@ -1909,13 +1758,6 @@ function initTTSSettings() {
     });
   }
 }
-
-window.addEventListener("beforeunload", () => {
-  if (typeof removeUpdaterStatusListener === "function") {
-    removeUpdaterStatusListener();
-    removeUpdaterStatusListener = null;
-  }
-});
 
 // ── Settings modal ──
 (function initSettings() {
@@ -2504,13 +2346,43 @@ window.addEventListener("beforeunload", () => {
     }
   });
 
-  const settingsCheckUpdateBtn   = document.getElementById("settings-check-update-btn");
-  const settingsUpdateFeedback   = document.getElementById("settings-update-feedback");
-  const settingsCurrentVersion   = document.getElementById("settings-current-version");
-  const settingsSuppressToggle   = document.getElementById("settings-suppress-updates");
-  const settingsIgnoredSection   = document.getElementById("settings-ignored-section");
-  const settingsIgnoredVersionEl = document.getElementById("settings-ignored-version-val");
-  const settingsClearIgnoredBtn  = document.getElementById("settings-clear-ignored-btn");
+  const settingsCheckUpdateBtn     = document.getElementById("settings-check-update-btn");
+  const settingsDownloadUpdateBtn  = document.getElementById("settings-download-update-btn");
+  const settingsInstallUpdateBtn   = document.getElementById("settings-install-update-btn");
+  const settingsIgnoreUpdateBtn    = document.getElementById("settings-ignore-update-btn");
+  const settingsUpdateStatusEl     = document.getElementById("settings-update-status");
+  const settingsUpdateFeedback     = document.getElementById("settings-update-feedback");
+  const settingsCurrentVersion     = document.getElementById("settings-current-version");
+  const settingsSuppressToggle     = document.getElementById("settings-suppress-updates");
+  const settingsIgnoredSection     = document.getElementById("settings-ignored-section");
+  const settingsIgnoredVersionEl   = document.getElementById("settings-ignored-version-val");
+  const settingsClearIgnoredBtn    = document.getElementById("settings-clear-ignored-btn");
+
+  let pendingUpdateVersion = null;
+  let removeUpdaterListener = null;
+
+  function setUpdateStatusText(text, state = "idle") {
+    if (!settingsUpdateStatusEl) return;
+    settingsUpdateStatusEl.textContent = text;
+    settingsUpdateStatusEl.dataset.state = state;
+  }
+
+  function setUpdateFeedback(text, isError = false) {
+    if (!settingsUpdateFeedback) return;
+    settingsUpdateFeedback.textContent = text || "";
+    settingsUpdateFeedback.className = isError ? "settings-feedback error" : "settings-feedback";
+  }
+
+  function showUpdateButtons({ check = true, checkDisabled = false, checkLabel = "检查更新", download = false, install = false, ignore = false } = {}) {
+    if (settingsCheckUpdateBtn) {
+      settingsCheckUpdateBtn.classList.toggle("hidden", !check);
+      settingsCheckUpdateBtn.disabled = checkDisabled;
+      settingsCheckUpdateBtn.textContent = checkLabel;
+    }
+    settingsDownloadUpdateBtn?.classList.toggle("hidden", !download);
+    settingsInstallUpdateBtn?.classList.toggle("hidden", !install);
+    settingsIgnoreUpdateBtn?.classList.toggle("hidden", !ignore);
+  }
 
   function syncUpdateSettings() {
     const ignored = localStorage.getItem(IGNORED_VERSION_KEY) || null;
@@ -2524,15 +2396,64 @@ window.addEventListener("beforeunload", () => {
     syncUpdateSettings();
     const bridge = window.bailongma;
     if (!bridge?.isElectron) {
-      if (settingsCurrentVersion) settingsCurrentVersion.textContent = "Desktop app only";
+      if (settingsCurrentVersion) settingsCurrentVersion.textContent = "仅桌面端可用";
       if (settingsCheckUpdateBtn) settingsCheckUpdateBtn.disabled = true;
+      setUpdateStatusText("仅桌面端可用", "muted");
       return;
     }
     try {
       const ver = await bridge.getVersion?.();
       if (settingsCurrentVersion && ver) settingsCurrentVersion.textContent = ver;
     } catch {}
+
+    removeUpdaterListener = bridge.onUpdaterStatus?.((payload = {}) => {
+      const stage = payload.stage || "idle";
+      const ver = payload.version || "";
+      const percent = typeof payload.percent === "number" ? Math.round(payload.percent) : null;
+
+      switch (stage) {
+        case "checking":
+          setUpdateStatusText("正在检查更新…", "checking");
+          showUpdateButtons({ checkDisabled: true, checkLabel: "检查中…" });
+          break;
+        case "available":
+          pendingUpdateVersion = ver;
+          setUpdateStatusText(`发现新版本 ${ver}`, "available");
+          showUpdateButtons({ check: false, download: true, ignore: true });
+          break;
+        case "downloading":
+          setUpdateStatusText(`下载中${percent !== null ? ` ${percent}%` : "…"}`, "downloading");
+          showUpdateButtons({ check: false });
+          break;
+        case "downloaded":
+          setUpdateStatusText(`版本 ${ver} 已就绪 — 重启后安装`, "ready");
+          showUpdateButtons({ check: false, install: true });
+          break;
+        case "up-to-date":
+          setUpdateStatusText(`已是最新版本 ${ver}`, "idle");
+          showUpdateButtons({ checkLabel: "检查更新" });
+          break;
+        case "error":
+          setUpdateStatusText(`更新失败：${payload.message || "请稍后再试"}`, "error");
+          showUpdateButtons({ checkLabel: "重试" });
+          break;
+        case "dev":
+          setUpdateStatusText("开发模式不检查更新", "muted");
+          showUpdateButtons({ checkDisabled: true, checkLabel: "开发模式" });
+          break;
+        default:
+          showUpdateButtons({});
+          break;
+      }
+    }) || null;
   }
+
+  window.addEventListener("beforeunload", () => {
+    if (typeof removeUpdaterListener === "function") {
+      removeUpdaterListener();
+      removeUpdaterListener = null;
+    }
+  });
 
   settingsSuppressToggle?.addEventListener("change", () => {
     localStorage.setItem(SUPPRESS_UPDATES_KEY, settingsSuppressToggle.checked ? "true" : "false");
@@ -2547,21 +2468,45 @@ window.addEventListener("beforeunload", () => {
   settingsCheckUpdateBtn?.addEventListener("click", async () => {
     const bridge = window.bailongma;
     if (!bridge?.isElectron) return;
-    if (settingsCheckUpdateBtn) { settingsCheckUpdateBtn.disabled = true; settingsCheckUpdateBtn.textContent = "Checking…"; }
-    if (settingsUpdateFeedback) settingsUpdateFeedback.textContent = "";
+    setUpdateStatusText("正在检查更新…", "checking");
+    setUpdateFeedback("");
+    showUpdateButtons({ checkDisabled: true, checkLabel: "检查中…" });
     try {
       const result = await bridge.checkForUpdates?.();
       if (result?.ok === false && result?.message) {
-        if (settingsUpdateFeedback) { settingsUpdateFeedback.textContent = `Failed: ${result.message}`; settingsUpdateFeedback.className = "settings-feedback error"; }
-      } else {
-        if (settingsUpdateFeedback) { settingsUpdateFeedback.textContent = "Check complete"; settingsUpdateFeedback.className = "settings-feedback"; }
-        setTimeout(() => { if (settingsUpdateFeedback) settingsUpdateFeedback.textContent = ""; }, 3000);
+        setUpdateStatusText(`更新失败：${result.message}`, "error");
+        showUpdateButtons({ checkLabel: "重试" });
       }
     } catch (err) {
-      if (settingsUpdateFeedback) { settingsUpdateFeedback.textContent = `Failed: ${err?.message || "Please try again later"}`; settingsUpdateFeedback.className = "settings-feedback error"; }
-    } finally {
-      if (settingsCheckUpdateBtn) { settingsCheckUpdateBtn.disabled = false; settingsCheckUpdateBtn.textContent = "Check for updates"; }
+      setUpdateStatusText(`更新失败：${err?.message || "请稍后再试"}`, "error");
+      showUpdateButtons({ checkLabel: "重试" });
     }
+  });
+
+  settingsDownloadUpdateBtn?.addEventListener("click", async () => {
+    const bridge = window.bailongma;
+    if (!bridge?.isElectron) return;
+    setUpdateStatusText("开始下载…", "downloading");
+    showUpdateButtons({ check: false });
+    try {
+      await bridge.startDownload?.();
+    } catch (err) {
+      setUpdateStatusText(`下载失败：${err?.message || "请稍后再试"}`, "error");
+      showUpdateButtons({ checkLabel: "重试" });
+    }
+  });
+
+  settingsInstallUpdateBtn?.addEventListener("click", () => {
+    window.bailongma?.quitAndInstall?.();
+  });
+
+  settingsIgnoreUpdateBtn?.addEventListener("click", () => {
+    if (pendingUpdateVersion) {
+      localStorage.setItem(IGNORED_VERSION_KEY, pendingUpdateVersion);
+      syncUpdateSettings();
+    }
+    setUpdateStatusText("已忽略此版本", "muted");
+    showUpdateButtons({ checkLabel: "检查更新" });
   });
 })();
 

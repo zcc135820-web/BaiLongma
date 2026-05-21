@@ -682,7 +682,16 @@ async function execSendMessage({ target_id, content, channel = 'AUTO' }, context
 
   if (socialResult?.ok) return `消息已发送至 ${resolvedId}（${socialResult.platform} 已投递）`
   if (socialResult?.skipped) return `消息已发送至 ${resolvedId}（社交平台未配置：${socialResult.reason}）`
-  if (socialResult && socialResult.ok === false) return `消息已尝试投递至 ${resolvedId}，但外部渠道失败：${socialResult.reason || socialResult.error || 'unknown'}`
+  if (socialResult && socialResult.ok === false) {
+    const reason = socialResult.reason || socialResult.error || 'unknown'
+    // wechat-clawbot 缺 context_token 是该渠道最常见的失败：重启后内存 Map 清空、或用户从未入站。
+    // 单独点名，让 LLM 直接告诉用户"先发一条过来"，不要去编造其他解释。
+    const isMissingContextToken = /no context_token/i.test(reason)
+    const hint = isMissingContextToken
+      ? '（wechat-clawbot 必须先收到该用户的入站消息才能回发；告诉用户先从微信给你发一条任意内容即可。）'
+      : ''
+    return `消息发送失败：外部渠道 ${delivery.deliveryChannel || 'unknown'} 投递未成功（${reason}）。${hint}请如实告知用户该消息未送达及原因。`
+  }
   return `消息已发送至 ${resolvedId}${channelLabel ? `（${channelLabel}）` : ''}`
 }
 

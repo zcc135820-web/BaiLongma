@@ -41,6 +41,9 @@ const KEYWORD_EXTRACT_BUDGET = 8
 // 太短的消息直接跳过焦点判断（裸字符长度，含格式头）。
 const MIN_MESSAGE_LENGTH = 4
 
+// 短回应（关键词不足但 body 长度 ≥ 此值）视为对栈顶的承诺/确认，保留栈顶不丢。
+const SHORT_RESPONSE_KEEP_THRESHOLD = 10
+
 // 判断当前输入是不是 TICK。复用 injector 的同源识别。
 function isTickMessage(message) {
   return typeof message === 'string' && /^TICK\s/i.test(message.trim())
@@ -178,8 +181,15 @@ export async function updateFocusFrame(state, message, {
 
   // 抽关键词
   const kws = extractKeywords(body, KEYWORD_EXTRACT_BUDGET)
-  // 关键词太少（≤2）= 太空泛，不动
+  // 关键词太少（≤2）= 太空泛，原则上不动
   if (kws.length < MIN_KEYWORDS_FOR_FRAME) {
+    const top = topOf(state.focusStack)
+    // 短回应带语境（>=阈值）通常是对栈顶的承诺/确认，不应丢栈
+    if (top && body.length >= SHORT_RESPONSE_KEEP_THRESHOLD) {
+      top.lastSeenTick = tickCounter
+      top.hitCount += 1
+      return { event: 'kept', poppedFrames: [] }
+    }
     return maybeClearStale(state, tickCounter)
   }
 

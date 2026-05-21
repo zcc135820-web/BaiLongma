@@ -5,6 +5,67 @@
 import { getDB, getRecentMemories, resetAll } from './db.js'
 import { runRecognizer } from './memory/recognizer.js'
 import { nowTimestamp } from './time.js'
+import { __extractKeywordsDebug } from './memory/keywords.js'
+import { updateFocusFrame } from './memory/focus.js'
+
+// ── 单元测试块：先跑纯函数测试，不依赖 DB/LLM ──
+{
+  console.log('[单元测试] 关键词过滤 + 焦点短回应救济\n')
+  let unitFailed = 0
+  const unitAssert = (cond, label) => {
+    if (!cond) {
+      console.error(`  FAIL: ${label}`)
+      unitFailed++
+    } else {
+      console.log(`  PASS: ${label}`)
+    }
+  }
+
+  // 1) "生成今天的日报" 不应在 final 中出现 "成今"、"天的" 这类跨词伪 ngram
+  {
+    const dbg = __extractKeywordsDebug('生成今天的日报')
+    unitAssert(!dbg.final.includes('成今'), '伪词"成今"未进入 final')
+    unitAssert(!dbg.final.includes('天的'), '伪词"天的"未进入 final')
+  }
+
+  // 2) "我想优化查询性能" → final 含 优化/查询/性能 中至少两个
+  {
+    const dbg = __extractKeywordsDebug('我想优化查询性能')
+    const hit = ['优化', '查询', '性能'].filter(w => dbg.final.includes(w)).length
+    unitAssert(hit >= 2, `优化/查询/性能 命中数=${hit} (需 >=2)`)
+  }
+
+  // 3) 栈顶 ["改","项目","名字"]，消息 "那就这样改吧好的" (>=10 字符) → kept
+  {
+    const state = {
+      focusStack: [{
+        topic: ['改', '项目', '名字'],
+        startedAtTick: 1,
+        lastSeenTick: 1,
+        hitCount: 1,
+        startedAt: new Date().toISOString(),
+        conclusions: [],
+      }],
+      tickCounter: 5,
+    }
+    // 关键词不足 3 但 body 长度 >= 10，应触发短回应救济
+    const r = await updateFocusFrame(state, '嗯就这样吧那就这样好的吧', {
+      isTick: false,
+      tickCounter: 5,
+      classifierEnabled: false,
+    })
+    unitAssert(r.event === 'kept', `短回应救济 event=${r.event} (期望 kept)`)
+    unitAssert(state.focusStack.length === 1, '短回应救济不改变栈深')
+    unitAssert(state.focusStack[0].hitCount === 2, `短回应救济 hitCount=${state.focusStack[0].hitCount} (期望 2)`)
+  }
+
+  if (unitFailed > 0) {
+    console.error(`\n[单元测试] ${unitFailed} 项失败`)
+    process.exitCode = 1
+  } else {
+    console.log('\n[单元测试] 全部通过\n')
+  }
+}
 
 getDB()
 

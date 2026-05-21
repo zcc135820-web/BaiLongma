@@ -17,13 +17,16 @@ const CLASSIFIER_TIMEOUT_MS = 800
 const CLASSIFIER_MAX_TOKENS = 120
 const CLASSIFIER_TEMPERATURE = 0.2
 
-const SYSTEM_PROMPT = `你是对话焦点分类器。判断这条新消息相对当前栈的关系：
-- kept     ：跟栈顶主题深化（同主题细化、追问、补充）
-- pushed   ：开新认知线程，跟栈中所有帧都不同
-- returned ：回到栈中某个旧帧的主题（说明 returns_to_depth 是栈中索引，栈顶=length-1）
-- leaf     ：一次性短问，不动栈
-另外把 topic 重写成 2-3 个真正反映主题的词。不要 ngram，要语义关键词。
-只输出 JSON，不要解释。`
+const SYSTEM_PROMPT = `焦点分类器。保守判 kept，不轻易 push。
+重叠度：高=对象同→kept；中=同域不同子任务→pushed；低=异域→pushed/leaf。
+kept：栈顶重叠高且细化/追问/承诺/确认。
+pushed：与所有帧重叠低且持续性新任务。
+returned：与非栈顶旧帧重叠高且明确回指（depth=该帧索引，栈顶=length-1）。
+leaf：无承接且一次性短问/闲聊（不动栈）。
+例 A [前端 React]+"写个 Hook"→kept
+例 B [DB 查询]+"现在网速咋样"→leaf
+例 C [配置→部署→监控]+"回头看最初配置"→returned d=0
+topic 写 2-3 个语义词非 ngram。只输 JSON。`
 
 // 把当前栈渲染成简短字符串：[栈底"a, b" → "c, d" → 栈顶"e, f"]
 function describeStack(stack) {

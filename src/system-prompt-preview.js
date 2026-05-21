@@ -1,5 +1,5 @@
 import { buildSystemPrompt, buildContextBlock, combinePromptForPreview } from './prompt.js'
-import { runInjector, formatMemoriesForPrompt, formatTaskKnowledge } from './memory/injector.js'
+import { runInjector, formatMemoriesForPrompt, formatTaskKnowledge, formatTemporalRecall } from './memory/injector.js'
 import { gatherContext, formatExtraContext } from './context/gatherer.js'
 import { getConfig, getKnownEntities, getOrInitBirthTime } from './db.js'
 import { formatTick, describeExistence } from './time.js'
@@ -26,6 +26,7 @@ export async function buildHeartbeatSystemPromptPreview({
   const memoriesText = formatMemoriesForPrompt(injection.memories, injection.recallMemories)
   const directionsText = directions.join('\n')
   const taskKnowledgeText = formatTaskKnowledge(injection.taskKnowledge)
+  const temporalRecallText = formatTemporalRecall(injection.temporalRecall)
 
   let extraContextText = ''
   if (workingState.task) {
@@ -50,6 +51,7 @@ export async function buildHeartbeatSystemPromptPreview({
 
   const contextBlock = buildContextBlock({
     memories: memoriesText,
+    temporalRecall: temporalRecallText,
     directions: directionsText,
     constraints: injection.constraints || [],
     personMemory: injection.personMemory || null,
@@ -88,6 +90,7 @@ export async function buildHeartbeatSystemPromptPreview({
     stateSnapshot: workingState,
     derived: {
       memoriesText,
+      temporalRecallText,
       directionsText,
       taskKnowledgeText,
       extraContextText,

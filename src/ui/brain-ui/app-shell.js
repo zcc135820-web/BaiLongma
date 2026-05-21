@@ -96,29 +96,8 @@ const createSecondaryPanel = () => `
     </div>
   </header>
 
-  <section class="focus-block" id="focus-block" data-state="empty">
-    <div class="focus-head">
-      <span class="focus-label">专注帧</span>
-      <span class="focus-depth" id="focus-depth">0</span>
-    </div>
-    <div class="focus-stack" id="focus-stack">
-      <div class="focus-empty" id="focus-empty">无专注</div>
-    </div>
-  </section>
-
-  <section class="update-card hidden" id="update-card">
-    <div class="update-copy">
-      <div class="update-title">桌面更新</div>
-      <div class="update-status" id="update-status">未检查</div>
-    </div>
-    <div class="update-actions">
-      <button class="update-action" id="check-update-btn" type="button">检查更新</button>
-      <button class="update-action hidden" id="download-update-btn" type="button">立即更新</button>
-      <button class="update-action update-action-install hidden" id="install-update-btn" type="button">立即重启</button>
-      <button class="update-ignore hidden" id="ignore-version-btn" type="button">忽略此版本</button>
-    </div>
-    <button class="update-close" id="update-close-btn" type="button" aria-label="关闭">×</button>
-  </section>
+  <!-- 专注帧 UI 已隐藏（后端 focus stack 仍在工作，给 LLM 注入上下文）。
+       要恢复观察面板时把对应 HTML 还原即可——app.js 渲染逻辑保留着，靠 getElementById 返回 null 自动 no-op。 -->
 
   <div class="stream-meta">
     <div>
@@ -435,7 +414,7 @@ const createSettingsModal = () => `
 
           <div class="settings-section">
             <div class="settings-section-label">语音合成（TTS）</div>
-            <p class="settings-hint">用语音发消息时，Agent 回复会自动转为语音播放。默认使用 MiniMax（复用已有 Key），也支持 OpenAI、ElevenLabs、火山引擎。</p>
+            <p class="settings-hint">用语音发消息时，Agent 回复会自动转为语音播放。首选推荐豆包语音合成 2.0（https://console.volcengine.com/speech/new/），也支持 MiniMax、OpenAI、ElevenLabs、火山引擎。</p>
             <div class="settings-row">
               <label class="settings-label" for="tts-provider-select">服务商</label>
               <select class="settings-select" id="tts-provider-select">
@@ -456,7 +435,7 @@ const createSettingsModal = () => `
                 <label class="settings-label" for="tts-doubao-key">API Key</label>
                 <input class="settings-input" type="password" id="tts-doubao-key" placeholder="留空则不修改">
               </div>
-              <p class="settings-hint">在<a href="https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey" target="_blank" style="color:var(--cool)">火山方舟控制台</a>获取 API Key。音色默认使用 seed-tts-2.0。</p>
+              <p class="settings-hint">在<a href="https://console.volcengine.com/speech/new/" target="_blank" style="color:var(--cool)">豆包语音合成 2.0 控制台</a>获取 API Key（需先完成实名认证和服务开通）。音色默认使用 seed-tts-2.0。</p>
             </div>
 
             <div id="tts-creds-minimax" style="display:none;">
@@ -559,8 +538,15 @@ const createSettingsModal = () => `
               <span class="settings-config-type">当前版本</span>
               <span class="settings-config-info" id="settings-current-version">—</span>
             </div>
-            <div class="settings-row-action" style="margin-top:12px;">
-              <button class="settings-save-btn" id="settings-check-update-btn" type="button">检查更新</button>
+            <div class="settings-config-row">
+              <span class="settings-config-type">状态</span>
+              <span class="settings-config-info" id="settings-update-status">未检查</span>
+            </div>
+            <div class="settings-row-action" style="margin-top:12px;gap:8px;flex-wrap:wrap;">
+              <button class="settings-save-btn" id="settings-check-update-btn" type="button" style="width:auto;padding:0 14px;">检查更新</button>
+              <button class="settings-save-btn hidden" id="settings-download-update-btn" type="button" style="width:auto;padding:0 14px;">立即下载</button>
+              <button class="settings-save-btn hidden" id="settings-install-update-btn" type="button" style="width:auto;padding:0 14px;">立即重启安装</button>
+              <button class="settings-save-btn hidden" id="settings-ignore-update-btn" type="button" style="width:auto;padding:0 14px;background:transparent;border:1px solid var(--line);color:var(--ink2);">忽略此版本</button>
               <span class="settings-feedback" id="settings-update-feedback"></span>
             </div>
           </div>

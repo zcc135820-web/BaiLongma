@@ -6,7 +6,7 @@ export const CONFIG_TOPICS = {
     title: '模型配置指南',
     subtitle: 'LLM Provider Configuration',
     icon: '🤖',
-    summary: '配置 AI 大模型服务商及 API Key。支持 DeepSeek、MiniMax、通义千问、Moonshot、智谱、OpenAI 及自定义端点。',
+    summary: '配置 AI 大模型服务商及 API Key。首选推荐 DeepSeek（官网 deepseek.com）。同时支持 MiniMax、通义千问、Moonshot、智谱、OpenAI 及自定义端点。',
     sections: [
       {
         title: '支持的服务商总览',
@@ -23,16 +23,18 @@ export const CONFIG_TOPICS = {
 只需填入 API Key，系统会自动识别服务商（Auto 模式）。`,
       },
       {
-        title: 'DeepSeek 配置',
-        content: `DeepSeek 国产高性能模型，性价比出色，中文效果好。
+        title: 'DeepSeek 配置（首选推荐）',
+        content: `白龙马首选大模型，国产高性能、性价比出色、中文效果好。
 
+■ 官网：https://deepseek.com
 ■ 字段：apiKey（格式：sk-xxxxxxxx）
 ■ 默认模型：deepseek-v4-flash
 
 申请步骤：
-1. 打开 https://platform.deepseek.com/ 注册/登录
-2. 进入「API Keys」→ 创建新 Key
+1. 打开官网 https://deepseek.com 注册/登录
+2. 进入开放平台 https://platform.deepseek.com/ →「API Keys」→ 创建新 Key
 3. 复制 Key，在模型设置中填写
+4. 注意：需先完成实名认证并开通 API 服务，按平台使用规则充值/领取额度
 
 文档：https://platform.deepseek.com/api-docs`,
       },
@@ -96,7 +98,7 @@ export const CONFIG_TOPICS = {
       },
     ],
     providers: [
-      { name: 'DeepSeek', url: 'https://platform.deepseek.com/', free: false, note: 'deepseek-v4-flash/pro' },
+      { name: 'DeepSeek（首选）', url: 'https://deepseek.com', free: false, note: '官网 deepseek.com，API 平台 platform.deepseek.com，deepseek-v4-flash/pro' },
       { name: 'MiniMax', url: 'https://platform.minimaxi.com/', free: false, note: 'MiniMax-M2.7，兼顾 TTS' },
       { name: '通义千问', url: 'https://bailian.console.aliyun.com/', free: false, note: 'qwen-turbo/plus' },
       { name: 'Moonshot', url: 'https://platform.moonshot.cn/', free: false, note: 'moonshot-v1-8k/32k' },

@@ -186,6 +186,23 @@ function initSchema() {
     }
   } catch {}
 
+  // 迁移（兜底）：visibility / hidden_at / merged_into 三件套。
+  // 上文 line ~51 已经尝试过这三个 ALTER，但顺序在 CREATE TABLE memories 之前——
+  // 全新安装时 memories 表不存在，ALTER 会失败被吞掉，导致新建的 memories 表缺这三列，
+  // 后续 insertMemory 里 `WHERE visibility = 1` 立刻崩。这里在 CREATE TABLE 之后再补一次，
+  // 用 PRAGMA table_info 做幂等检查（与上面 embedding 同模式），不会重复加列。
+  try {
+    const cols = db.prepare(`PRAGMA table_info(memories)`).all()
+    const have = new Set(cols.map(c => c.name))
+    if (!have.has('visibility'))   db.exec(`ALTER TABLE memories ADD COLUMN visibility INTEGER NOT NULL DEFAULT 1`)
+    if (!have.has('hidden_at'))    db.exec(`ALTER TABLE memories ADD COLUMN hidden_at TEXT`)
+    if (!have.has('merged_into'))  db.exec(`ALTER TABLE memories ADD COLUMN merged_into TEXT`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_memories_visibility ON memories(visibility)`)
+  } catch (err) {
+    // 这一步真的失败的话后续 SELECT visibility 会全崩——日志告警让用户知道
+    console.error('[DB migration] critical: visibility column migration failed:', err.message)
+  }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS action_logs (
       id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -392,8 +409,38 @@ function initSchema() {
     );
   `)
 
+  // wechat-clawbot 上下文令牌持久化：
+  //   wechat-ilink-client 库内部用一个内存 Map<from_user_id, context_token> 缓存每个用户的会话令牌，
+  //   每次入站消息刷新一次，重启即丢——重启后想"主动"给该用户发消息会抛 No context_token。
+  //   把这层映射持久化下来，启动时回填到 client.contextTokens，能让"老朋友"在重启后立即可达。
+  //   服务端令牌仍可能过期，这只是个尽力而为的缓存，所以 executor 兜底文案保留。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS wechat_clawbot_tokens (
+      from_user_id  TEXT    PRIMARY KEY,
+      context_token TEXT    NOT NULL,
+      updated_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+  `)
+
   // 重建 FTS 索引（覆盖已有数据，确保历史记忆也被索引）
   db.exec(`INSERT INTO memories_fts(memories_fts) VALUES('rebuild')`)
+}
+
+export function upsertClawbotToken(fromUserId, contextToken) {
+  if (!fromUserId || !contextToken) return
+  getDB().prepare(
+    `INSERT INTO wechat_clawbot_tokens (from_user_id, context_token, updated_at)
+     VALUES (?, ?, datetime('now'))
+     ON CONFLICT(from_user_id) DO UPDATE SET
+       context_token = excluded.context_token,
+       updated_at    = excluded.updated_at`
+  ).run(String(fromUserId), String(contextToken))
+}
+
+export function getAllClawbotTokens() {
+  return getDB().prepare(
+    `SELECT from_user_id, context_token FROM wechat_clawbot_tokens`
+  ).all()
 }
 
 export function insertUISignal({ type, target = null, payload = {}, ts = Date.now() }) {
@@ -1078,6 +1125,43 @@ export function getMemoriesByTimeRange(from, to, limit = 20) {
     ORDER BY timestamp DESC
     LIMIT ?
   `).all(from, to, limit)
+}
+
+// 按日期窗口拉记忆，给"听见昨天/前天"类的时间词触发的自动注入用。
+// 跟 getMemoriesByTimeRange 的区别：
+//   - 半开区间 [from, to)，避免跨日边界双重计入
+//   - 支持 types / minSalience 过滤
+//   - 默认按 salience desc, timestamp asc：先重要、再时间早晚
+// 时区注意：from/to 用本地带偏移 ISO（同 nowTimestamp），memories.timestamp 也是。
+// 用 strftime('%s', ...) 转 unixepoch 比较，避开字符串字典序在 '+08:00' / 'Z' 上的踩坑。
+export function getMemoriesByDateRange(from, to, {
+  types = null,
+  minSalience = null,
+  limit = 8,
+  orderBy = 'COALESCE(salience, 3) DESC, timestamp ASC',
+} = {}) {
+  const db = getDB()
+  const conditions = [
+    `strftime('%s', timestamp) >= strftime('%s', ?)`,
+    `strftime('%s', timestamp) <  strftime('%s', ?)`,
+    VISIBLE_CLAUSE,
+  ]
+  const params = [from, to]
+  if (Array.isArray(types) && types.length > 0) {
+    conditions.push(`event_type IN (${types.map(() => '?').join(',')})`)
+    params.push(...types)
+  }
+  if (minSalience != null) {
+    conditions.push(`COALESCE(salience, 3) >= ?`)
+    params.push(minSalience)
+  }
+  params.push(limit)
+  return db.prepare(`
+    SELECT * FROM memories
+    WHERE ${conditions.join(' AND ')}
+    ORDER BY ${orderBy}
+    LIMIT ?
+  `).all(...params)
 }
 
 // 清除所有记忆和配置（测试用，谨慎使用）

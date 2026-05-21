@@ -4,6 +4,7 @@ import {
   getTaskKnowledge,
   getPersonMemory,
   getMemoriesByEntity,
+  getMemoriesByDateRange,
   getRecentConversation,
   getRecentConversationTimeline,
   getRecentActionLogs,
@@ -15,6 +16,7 @@ import { getActiveUICards } from '../events.js'
 import { getInstalledToolNames } from '../capabilities/marketplace/index.js'
 import { PRIMARY_USER_ID } from '../identity.js'
 import { extractKeywords } from './keywords.js'
+import { parseTemporalHints, stripTemporalWords } from './temporal-parser.js'
 import { selectTools } from './tool-router.js'
 
 // 旧 import 路径兼容：focus.js / 其他模块也能从 injector 拿到 extractKeywords
@@ -179,6 +181,63 @@ function deduplicateMemories(arrays) {
   return result
 }
 
+// 时间词触发的自动注入：把用户消息里的"昨天/前天/今天"映射成日期窗口，
+// 在该窗口内拉 focus_conclusion（每帧 pop 时压成的 1-2 句话结论），
+// 形成"听见昨天就立马想起几件事"的轮廓注入。
+//
+// 设计点：
+//   - 上限 5 条 / 区间，按 salience desc + 时间正序排列
+//   - 只在有 senderId 的用户消息上触发（TICK / agent 自言自语不触发）
+//   - 召回为空就返回 null，整个 <temporal-recall> 块不出现
+//   - 不注入对话原文，只注入压缩后的结论，控制注入量在 600 token 以内
+//   - 多个时间词共存（"昨天和前天的事"）时，各自取 5 条然后合并去重
+function gatherTemporalRecall(messageBody) {
+  if (!messageBody) return null
+  const hints = parseTemporalHints(messageBody)
+  if (hints.length === 0) return null
+
+  const buckets = []
+  const seenIds = new Set()
+  for (const hint of hints) {
+    const memories = getMemoriesByDateRange(hint.from, hint.to, {
+      types: ['focus_conclusion'],
+      limit: 5,
+      orderBy: 'COALESCE(salience, 3) DESC, timestamp ASC',
+    })
+    // 去重：同一条记忆若被两个区间命中（理论上日期窗口不重叠不会发生），只算一次
+    const filtered = memories.filter(m => {
+      if (seenIds.has(m.id)) return false
+      seenIds.add(m.id)
+      return true
+    })
+    if (filtered.length === 0) continue
+    buckets.push({
+      label: hint.label,
+      date: hint.from.slice(0, 10), // YYYY-MM-DD
+      memories: filtered,
+    })
+  }
+  if (buckets.length === 0) return null
+  return buckets
+}
+
+// 渲染成 <temporal-recall> 块的字符串（多个区间各自一段）。
+// 给 prompt.js / system-prompt-preview.js 用，injector 只负责出 buckets 数据。
+export function formatTemporalRecall(buckets) {
+  if (!buckets || buckets.length === 0) return ''
+  return buckets.map(b => {
+    const lines = b.memories.map(m => {
+      const timePart = (m.timestamp || '').slice(11, 16) // HH:MM
+      const star = (m.salience ?? 3) >= 4 ? '★ ' : ''
+      const title = m.title ? m.title.replace(/^专注结论：/, '').trim() : ''
+      const topicHint = title ? `[${title}] ` : ''
+      const body = (m.content || '').replace(/\s+/g, ' ').trim()
+      return `- ${timePart} ${star}${topicHint}${body}`
+    }).join('\n')
+    return `<temporal-recall date="${b.date}" label="${b.label}">\n${lines}\n</temporal-recall>`
+  }).join('\n\n')
+}
+
 // hint：一层思考器的输出文本，用于扩展 L2 的记忆检索范围
 export async function runInjector({ message, state, hint = '' }) {
   const lastToolResult = state?.lastToolResult || null
@@ -187,7 +246,7 @@ export async function runInjector({ message, state, hint = '' }) {
   const confidenceHint = state?.pendingConfidenceHint || null
   if (state && 'pendingConfidenceHint' in state) state.pendingConfidenceHint = null  // 消费即焚
 
-  const { senderId, messageBody } = parseMessageInput(message)
+  const { isTick: isTickMessage, senderId, messageBody } = parseMessageInput(message)
   const hasTask = !!state?.task
 
   const constraints = getActiveConstraints()
@@ -206,6 +265,11 @@ export async function runInjector({ message, state, hint = '' }) {
     senderMemories = getMemoriesByEntity(PRIMARY_USER_ID, 10)
   }
 
+  // 时间词触发的轮廓注入：除 TICK 心跳外都跑。
+  // 用 isTick 而不是 senderId 判断——这样外部渠道未带 [ID:...] 前缀的裸消息也能触发；
+  // agent 自言自语不走 runInjector，不必担心循环放大。
+  const temporalRecall = isTickMessage ? null : gatherTemporalRecall(messageBody)
+
   const hintText = hint ? hint.replace(/<think>[\s\S]*?<\/think>/gi, '').slice(0, 800) : ''
   const conversationText = conversationWindow
     .map(item => item.content || '')
@@ -213,8 +277,13 @@ export async function runInjector({ message, state, hint = '' }) {
     .join(' ')
     .slice(0, 4000)
 
+  // messageBody 在送进 FTS5 关键词抽取前，先把"昨天/前天/今天"等时间词剥掉。
+  // 否则跨边界 ngram（如"昨天我"）会进入字面搜索，召回所有 content 含"昨天我"的旧记忆，
+  // 跟用户真正的"昨天"完全无关。时间窗口召回已经被 gatherTemporalRecall 接管。
+  const focusBodyForKeywords = temporalRecall ? stripTemporalWords(messageBody) : messageBody
+
   const focusText = [
-    messageBody,
+    focusBodyForKeywords,
     hasTask ? state.task : '',
     hintText,
   ].filter(Boolean).join(' ')
@@ -326,6 +395,7 @@ export async function runInjector({ message, state, hint = '' }) {
     prefetchedItems,
     uiSignalSummary,
     activeUICards,
+    temporalRecall,
   }
 }
 

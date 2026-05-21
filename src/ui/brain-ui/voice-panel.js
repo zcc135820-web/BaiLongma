@@ -324,6 +324,8 @@ export function initVoicePanel({
   // 自动发送防抖
   let lastTranscriptText = '';
   let autoSendTimer = null;
+  // PTT 按住期间禁用自动发送（由 pttEnd 在松手时统一发送）
+  let pttHolding = false;
   // 多句累积：Paraformer 按句回调，需拼接完整段落
   let accumulatedText = '';
 
@@ -369,6 +371,7 @@ export function initVoicePanel({
 
   // 防抖自动发送：收到任意转录文字就重置 2s 计时器，停说 2s 后自动发
   function scheduleAutoSend() {
+    if (pttHolding) return;
     if (autoSendTimer) clearTimeout(autoSendTimer);
     autoSendTimer = setTimeout(() => {
       autoSendTimer = null;
@@ -510,6 +513,7 @@ export function initVoicePanel({
   }
 
   function stopVoiceInput({ keepIntent = false, reason = '' } = {}) {
+    pttHolding = false;
     if (doneTimer) { clearTimeout(doneTimer); doneTimer = null; }
     if (autoSendTimer) { clearTimeout(autoSendTimer); autoSendTimer = null; }
     clearBargeinNoSpeechTimer();
@@ -640,6 +644,7 @@ export function initVoicePanel({
 
   async function pttStart() {
     // 让 release 时不会发出旧的累积识别结果
+    pttHolding = true;
     lastTranscriptText = '';
     if (autoSendTimer) { clearTimeout(autoSendTimer); autoSendTimer = null; }
 
@@ -659,6 +664,7 @@ export function initVoicePanel({
   }
 
   function pttEnd() {
+    pttHolding = false;
     const startedMic = pttStartedMic;
     pttStartedMic = false;
     if (!micActive) return;

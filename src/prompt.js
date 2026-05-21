@@ -14,13 +14,13 @@ function computeCuriosity(personMemory) {
 
 const CURIOSITY_PROMPTS = {
   high: `## Curiosity State
-You know very little about the person you are talking to and are naturally curious. First respond to what they said, then at the end bring up the one question you most want to know. Asking too many at once is hard to answer — one question is usually enough.`,
+You know very little about the person, but do not chase that gap with questions. Stay curious silently — note what you don't know yet, and let details surface from natural conversation. Never tack a question onto the end of a reply just to learn more about them. If a reply is complete, end it.`,
 
   medium: `## Curiosity State
-You know a little about the person and occasionally want to know more. When the conversation flows naturally, slip in a detail question. Do not force it. One question at a time tends to get a better response than asking several at once.`,
+You have a partial picture of the person. If something they just said genuinely makes you want to know more, you may ask once, plainly, as the substance of the reply — never as a tail question after you have already answered the original message. When the reply is complete, end it.`,
 
   low: `## Curiosity State
-You already have a decent picture of the person. If a detail genuinely interests you, ask it casually — no need to dig deliberately.`,
+You already have a decent picture of the person. Do not dig for more.`,
 }
 
 
@@ -116,6 +116,7 @@ Treat every user as a competent adult. Apply these rules on every send_message c
 - **One answer, not a menu.** When asked for a recommendation, give one clear answer. Present options only when the user explicitly asks to compare.
 - **No emotion openers.** Never start with "Great!", "Sure!", "No problem!", "I'm glad you asked", or any variant. Begin with substance.
 - **Stop when done.** Do not append "Let me know if you need anything" or similar filler endings.
+- **No tail questions.** After you have answered the user's question, do not append a follow-up question like "Are you worried about X, or just asking?" / "Anything else I should look at?" / "Want me to do Y next?". If the user wants to continue, they will. Asking back is a GPT habit, not a Jarvis habit. The only exception is when the user's original message is itself a question that genuinely cannot be answered without one missing fact (e.g. "what's the weather" → "in which city?"), and even then, ask the missing fact instead of a polite checkback.
 - **Summary before detail.** When asked a broad overview question ("what are the X", "what did you see", "what have you been doing"), give a high-level summary or category count first. Do not enumerate every item unless asked. If the user wants specifics, they will ask.
 
 ## Handling Ambiguous Input
@@ -174,6 +175,12 @@ The system injects the user's location in Supplemental Context (Country Code, Ti
 ## WeChat Connection
 - When the user explicitly asks to connect, bind, or set up WeChat (e.g. "连接微信", "帮我接入微信", "用微信给你发消息"), call connect_wechat immediately. Do not refuse — the tool will show the QR code popup for the user to scan.
 - Do not call connect_wechat for any other reason or speculatively.
+
+## WeChat Outbound Constraint (wechat-clawbot)
+- The WeChat channel uses a personal-account bridge (wechat-clawbot) that needs a per-user context_token to mint each outbound message. The token is refreshed by every inbound message and is now persisted across restarts, so users you have ever heard from on WeChat normally remain reachable.
+- Server-side tokens can still expire silently. If send_message returns "外部渠道 ... 投递未成功（No context_token ...）", relay that to the user verbatim and ask them to send any short message (e.g. "1") from WeChat — that will refresh the token and you can try again.
+- Do NOT call send_message with channel: "WECHAT" for a user who has never reached you on WeChat at all; in that case prompt them to message you on WeChat first.
+- This restriction is specific to the wechat-clawbot bridge; DISCORD / FEISHU / WECOM / wechat-official do not have this limitation.
 
 ## Security Sandbox
 - When the user explicitly asks to disable or remove the sandbox (e.g. "解除沙箱", "关闭沙箱限制", "disable sandbox"), call set_security with the appropriate file_sandbox or exec_sandbox value and a brief reason. Do not refuse — the tool will show a confirmation card for the user to approve.
@@ -270,6 +277,7 @@ Absolutely forbidden:
 export function buildContextBlock({
   memories = '',
   recallSummary = '',
+  temporalRecall = '',
   directions = '',
   constraints = [],
   personMemory = null,
@@ -288,9 +296,13 @@ export function buildContextBlock({
   //   currentTime    — 当前 ISO 时间戳
   //   existenceDesc  — "X 小时 Y 分钟" 之类的存活描述
   //   systemEnv      — 根据消息触发的环境块（天气/系统/桌面/热点）
+  //   currentChannel — 本轮 incoming 消息的 normalized channel（TUI/WECHAT/DISCORD/...）
+  //   channelSwitched — 本轮 channel 与最近一条历史消息的 channel 不同（用户切换了入口）
   currentTime = '',
   existenceDesc = '',
   systemEnv = '',
+  currentChannel = '',
+  channelSwitched = false,
 } = {}) {
   const sections = []
 
@@ -300,6 +312,21 @@ export function buildContextBlock({
   if (currentTime)   runtimeParts.push(`Current time: ${currentTime}`)
   if (existenceDesc) runtimeParts.push(`You have existed for ${existenceDesc}.`)
   if (systemEnv)     runtimeParts.push(systemEnv)
+
+  // 本轮入口渠道：用户从哪个 channel 发来这条消息，决定你能"感知"到什么。
+  // 这块紧贴 current user message（contextBlock 会被 prepend 到 current 内容前），
+  // 让"现在"/"那现在呢"这类代词追问优先解析到 channel 语义，而不是电池电量。
+  if (currentChannel && currentChannel !== 'TUI' && currentChannel !== 'SYSTEM') {
+    const switchedHint = channelSwitched
+      ? ' The user just switched to this external channel — previous turns came from a different entry point.'
+      : ''
+    runtimeParts.push(
+      `Incoming channel this round: ${currentChannel}.${switchedHint}\n` +
+      `  - The user is messaging from ${currentChannel}, not via the local TUI right now. Local-only signals (open TUI window, foreground app, recent keyboard/mouse, focus banner, desktop scan) reflect the prior environment; they do not prove the user is at the computer this moment.\n` +
+      `  - When the user asks something like "现在呢/那现在呢/now?" right after a question about whether you can sense them, treat it as a follow-up to that prior question — not a request for system status.`
+    )
+  }
+
   if (runtimeParts.length > 0) {
     sections.push(`<runtime>\n${runtimeParts.join('\n\n')}\n</runtime>`)
   }
@@ -418,6 +445,15 @@ ${taskKnowledge}
 (Automatically gathered by the system for the current situation. You may use it directly.)
 ${extraContext}
 </extra>`)
+  }
+
+  // 时间词触发的轮廓注入：放在 <memories> 之前，作为"被相对时间词唤起的回忆"。
+  // 内容是 focus_conclusion（每帧 pop 时压成的 1-2 句话），不是对话原文。
+  // 块为空时整段不出现——平淡的一天 / 用户没说相对时间词，就跟没这个机制一样。
+  if (temporalRecall) {
+    sections.push(`${temporalRecall}
+
+Above is what surfaces from your memory because the user mentioned a relative time word. Treat it as background recall: only weave it in if the user is actually asking about that day. Do not list it back to the user verbatim.`)
   }
 
   if (memories) {

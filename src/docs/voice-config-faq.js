@@ -8,7 +8,7 @@ export const DOC_TOPICS = {
     title: '语音识别（ASR）配置指南',
     subtitle: 'Automatic Speech Recognition',
     icon: '🎤',
-    summary: '语音识别将麦克风输入实时转为文字。支持本地 Whisper 和三家云端服务。配置入口：点击左上角 ⚙ → 语音设置。',
+    summary: '语音识别将麦克风输入实时转为文字。首选推荐阿里云百炼 Paraformer（https://bailian.console.aliyun.com/）。也支持腾讯云、科大讯飞和本地 Whisper。配置入口：点击左上角 ⚙ → 语音设置。',
     sections: [
       {
         title: '为什么语音识别没有内容？',
@@ -19,17 +19,20 @@ export const DOC_TOPICS = {
 ④ 密钥填写错误或账户欠费 — 检查控制台报错信息`,
       },
       {
-        title: '模式一：阿里云百炼 Paraformer（推荐，延迟低）',
-        content: `阿里云百炼实时语音识别，中文效果出色，延迟低。
+        title: '模式一：阿里云百炼 Paraformer（首选推荐，延迟低）',
+        content: `白龙马首选 ASR 方案，阿里云百炼实时语音识别，中文效果出色，延迟低。
 
 配置字段（POST /settings/voice）：
 ■ aliyunApiKey — 阿里云百炼的 API Key（格式：sk-xxxxxxxxxxxxxxxx）
 
 申请步骤：
 1. 打开 https://bailian.console.aliyun.com/ 注册/登录
-2. 搜索「Paraformer」或「语音识别」，开通服务
-3. 前往 API Key 管理页面，创建新的 API Key
-4. 复制 API Key，在语音设置中填写 aliyunApiKey 字段
+2. 完成阿里云账号实名认证（个人/企业均可）
+3. 搜索「Paraformer」或「语音识别」，开通该模型服务（按平台使用规则开通）
+4. 前往 API Key 管理页面，创建新的 API Key
+5. 复制 API Key，在语音设置中填写 aliyunApiKey 字段
+
+提醒：必须先完成认证 + 开通对应模型，未开通时调用会直接报错。
 
 文档：https://help.aliyun.com/zh/model-studio/developer-reference/paraformer-v2`,
       },
@@ -71,7 +74,7 @@ export const DOC_TOPICS = {
       },
     ],
     providers: [
-      { name: '阿里云百炼 Paraformer', url: 'https://bailian.console.aliyun.com/', free: false, note: '推荐，延迟低，字段：aliyunApiKey' },
+      { name: '阿里云百炼 Paraformer（首选）', url: 'https://bailian.console.aliyun.com/', free: false, note: '首选推荐，延迟低，字段：aliyunApiKey（需先认证+开通模型）' },
       { name: '腾讯云 ASR', url: 'https://console.cloud.tencent.com/asr', free: false, note: '多语种，字段：tencentSecretId/Key/AppId' },
       { name: '科大讯飞 RTASR', url: 'https://www.xfyun.cn/', free: false, note: '中文老牌，字段：xunfeiAppId/ApiKey/ApiSecret' },
     ],
@@ -82,7 +85,7 @@ export const DOC_TOPICS = {
     title: '语音合成（TTS）配置指南',
     subtitle: 'Text-to-Speech',
     icon: '🔊',
-    summary: '语音合成将文字转为 Agent 语音输出。支持豆包、MiniMax、OpenAI、ElevenLabs、火山引擎。配置入口：点击左上角 ⚙ → 语音设置 → TTS。',
+    summary: '语音合成将文字转为 Agent 语音输出。首选推荐豆包语音合成 2.0（https://console.volcengine.com/speech/new/）。也支持 MiniMax、OpenAI、ElevenLabs、火山引擎。配置入口：点击左上角 ⚙ → 语音设置 → TTS。',
     sections: [
       {
         title: '为什么 Agent 说话没有声音？',
@@ -93,12 +96,12 @@ export const DOC_TOPICS = {
 ④ 未选择 TTS 服务商 — 请在语音设置的「TTS 服务商」下拉框中选择一个`,
       },
       {
-        title: '豆包（火山方舟）TTS — 推荐',
-        content: `字节跳动旗下 TTS，中文音色丰富，流式输出，延迟低。
+        title: '豆包语音合成 2.0（首选推荐）',
+        content: `白龙马首选 TTS 方案，字节跳动豆包语音合成 2.0，中文音色丰富，流式输出，延迟低。
 
 配置字段（POST /settings/tts）：
 ■ ttsProvider = "doubao"
-■ doubaoKey — 火山方舟 API Key（推荐，格式：xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）
+■ doubaoKey — 豆包语音平台 API Key（推荐，格式：xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）
 ■ doubaoAccessKey — 火山引擎平台 Access Key（与 doubaoKey 二选一）
 ■ doubaoAppId — 应用 App ID（可选）
 ■ doubaoResourceId — 语音资源 ID（可选，留空自动根据音色判断）
@@ -110,10 +113,14 @@ export const DOC_TOPICS = {
 → zh_female_shuangkuaisisi_uranus_bigtts（爽快思思 2.0，活泼）
 
 申请步骤：
-1. 打开 https://console.volcengine.com/ark 注册/登录火山引擎
-2. 进入「火山方舟」→「在线推理」，开通语音合成服务
+1. 打开 https://console.volcengine.com/speech/new/ 注册/登录火山引擎
+2. 完成实名认证后，开通「语音合成 2.0（大模型语音合成）」服务（按平台使用规则操作）
 3. 在「API Key 管理」创建 API Key，填写到 doubaoKey
+4. 若需指定音色，先在控制台为应用授权对应音色，再把音色 ID 填入 ttsVoiceId
 
+提醒：必须先完成认证 + 开通服务 + 音色授权，否则会报权限/资源错误。
+
+控制台：https://console.volcengine.com/speech/new/
 文档：https://www.volcengine.com/docs/6561/1598757`,
       },
       {
@@ -207,7 +214,7 @@ export const DOC_TOPICS = {
       },
     ],
     providers: [
-      { name: '豆包（火山方舟）', url: 'https://console.volcengine.com/ark', free: false, note: '推荐，流式低延迟，字段：doubaoKey' },
+      { name: '豆包语音合成 2.0（首选）', url: 'https://console.volcengine.com/speech/new/', free: false, note: '首选推荐，流式低延迟，字段：doubaoKey（需先认证+开通+音色授权）' },
       { name: 'MiniMax', url: 'https://platform.minimaxi.com/', free: false, note: '复用 LLM 密钥，无需额外配置' },
       { name: 'OpenAI TTS', url: 'https://platform.openai.com/', free: false, note: '英文顶级，字段：openaiTtsKey' },
       { name: 'ElevenLabs', url: 'https://elevenlabs.io/', free: true, note: '超自然音色，字段：elevenLabsKey' },
@@ -235,9 +242,15 @@ export const DOC_TOPICS = {
       },
       {
         title: '推荐配置组合',
-        content: `■ 最低延迟（国内）：阿里云百炼 ASR（aliyunApiKey） + 豆包方舟 TTS（doubaoKey）
+        content: `■ 白龙马首选组合（强烈推荐）：
+  · 大模型：DeepSeek（官网 deepseek.com）
+  · 语音识别：阿里云百炼 Paraformer（https://bailian.console.aliyun.com/，字段 aliyunApiKey）
+  · 语音合成：豆包语音合成 2.0（https://console.volcengine.com/speech/new/，字段 doubaoKey）
+
 ■ 最佳英文体验：科大讯飞 ASR + OpenAI TTS（openaiTtsKey）或 ElevenLabs（elevenLabsKey）
-■ 已用 MiniMax 作为 LLM：阿里云百炼 ASR + MiniMax TTS（自动复用密钥）`,
+■ 已用 MiniMax 作为 LLM：阿里云百炼 ASR + MiniMax TTS（自动复用密钥）
+
+提醒：以上语音识别 / 语音合成服务都需要先到官网申请 API Key，并完成实名认证和服务开通后才能使用，请按平台的使用规则操作。`,
       },
       {
         title: '配置后如何测试？',

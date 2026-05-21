@@ -1,5 +1,6 @@
 import { WeChatClient } from 'wechat-ilink-client'
 import { getClawbotCredentials, setClawbotCredentials, clearClawbotCredentials } from '../config.js'
+import { upsertClawbotToken, getAllClawbotTokens } from '../db.js'
 
 let client = null
 let currentQrUrl = null   // set during login, cleared after scan
@@ -42,7 +43,64 @@ export function startClawbotConnector({ pushMessage, emitEvent } = {}) {
     baseUrl: saved.baseUrl,
   } : {})
 
+  // Monkey-patch client.api.apiFetch：库内部 sendMessage 只 await apiFetch、丢掉响应文本，
+  // 而 apiFetch 仅在 HTTP !res.ok 时抛错——HTTP 200 + body 里 {"ret": -1} 这种业务失败被完全吞掉，
+  // 导致 sendText 报"成功"但消息没投递。这里拦响应：sendmessage 端点解析 JSON，
+  // 发现非零 ret/code 时显式抛错，让上层 sendClawbotMessage 的 catch 拿到真实失败原因。
+  try {
+    const rawApiFetch = client.api?.apiFetch?.bind(client.api)
+    if (typeof rawApiFetch === 'function') {
+      client.api.apiFetch = async (params) => {
+        const rawText = await rawApiFetch(params)
+        if (params?.endpoint === 'ilink/bot/sendmessage') {
+          let body = null
+          try { body = JSON.parse(rawText) } catch {}
+          if (body && typeof body === 'object') {
+            const ret = body.ret ?? body.code ?? body.errcode
+            if (ret != null && ret !== 0) {
+              const errMsg = body.err_msg || body.errmsg || body.message || body.msg || ''
+              console.error(`[ClawBot] sendMessage 服务端拒绝 ret=${ret} ${errMsg} raw=${rawText.slice(0, 500)}`)
+              throw new Error(`iLink sendmessage rejected: ret=${ret} ${errMsg}`)
+            }
+          }
+        }
+        return rawText
+      }
+      console.log('[ClawBot] sendMessage 响应校验已启用')
+    } else {
+      console.warn('[ClawBot] client.api.apiFetch 不可访问，跳过响应校验（库实现可能已变化）')
+    }
+  } catch (err) {
+    console.warn(`[ClawBot] 安装响应校验失败（不致命，继续启动）: ${err.message}`)
+  }
+
+  // 启动时把上次落盘的 context_token 回填到内存 Map：
+  // ilink 库 sendText 用的是 this.contextTokens.get(to)，重启后这个 Map 是空的；
+  // 不回填则只能等用户先发一条新消息才能回复。token 可能服务端已过期，所以
+  // sendText 仍可能失败，executor 已有兜底提示，这里只是尽量恢复。
+  // contextTokens 在 .d.ts 里是 private 但运行时是普通 class field —— 加 guard 防作者哪天换成 # 真私有。
+  try {
+    if (client.contextTokens instanceof Map) {
+      const rows = getAllClawbotTokens()
+      if (rows.length) {
+        for (const row of rows) {
+          client.contextTokens.set(row.from_user_id, row.context_token)
+        }
+        console.log(`[ClawBot] 已从持久化恢复 ${rows.length} 条 context_token`)
+      }
+    } else {
+      console.warn('[ClawBot] client.contextTokens 不可访问（库实现可能已变化），跳过 token 恢复')
+    }
+  } catch (err) {
+    console.warn(`[ClawBot] 恢复 context_token 失败（不致命，继续启动）: ${err.message}`)
+  }
+
   client.on('message', (msg) => {
+    // 每条入站消息都带新鲜的 context_token —— 库已经在内部 set 到 Map 了，
+    // 这里只是同步落盘一份，让下次重启能继承当前会话。
+    if (msg?.context_token && msg?.from_user_id) {
+      try { upsertClawbotToken(msg.from_user_id, msg.context_token) } catch {}
+    }
     const text = WeChatClient.extractText?.(msg) ?? extractText(msg)
     if (!text) return
     const fromId = `wechat:clawbot:${msg.from_user_id}`

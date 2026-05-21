@@ -92,7 +92,15 @@ async function streamOnce({ messages, toolSchemas, temperature, topP, maxTokens,
           toolCallsMap[idx] = { id: tc.id || '', name: '', arguments: '' }
         }
         if (tc.id) toolCallsMap[idx].id = tc.id
-        if (tc.function?.name) toolCallsMap[idx].name += tc.function.name
+        if (tc.function?.name) {
+          const wasEmpty = toolCallsMap[idx].name === ''
+          toolCallsMap[idx].name += tc.function.name
+          // 第一次拿到完整 name 时通知上层 —— 此时流文本已 end，但工具尚未执行，
+          // 没有这个信号 UI 会出现"思考动画停止 → 工具行出现"之间的死寂。
+          if (wasEmpty && toolCallsMap[idx].name) {
+            onStream?.({ event: 'tool_preparing', name: toolCallsMap[idx].name })
+          }
+        }
         if (tc.function?.arguments) toolCallsMap[idx].arguments += tc.function.arguments
       }
       continue
@@ -549,7 +557,7 @@ function throwIfAborted(signal) {
 
 // 主调用：agentic 循环，连续执行工具直到模型停止
 // 返回 { content: string, toolResult: { name, args, result } | null, aborted: bool }
-export async function callLLM({ systemPrompt, message, messages: inputMessages = null, temperature = 0.5, topP = 0.9, tools = [], maxTokens, thinking = true, signal, onToolCall, onStream, onRetry, toolContext = {}, mustReply = false }) {
+export async function callLLM({ systemPrompt, message, messages: inputMessages = null, temperature = 0.5, topP = 0.9, tools = [], maxTokens, thinking = true, signal, onToolCall, onToolExecute, onStream, onRetry, toolContext = {}, mustReply = false }) {
   const toolSchemas = getToolSchemas(tools)
 
   const messages = Array.isArray(inputMessages) && inputMessages.length > 0
@@ -670,11 +678,18 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
         result = makeToolLoopStoppedResult(tc.name, stopReason)
         console.log(`[工具熔断] ${tc.name}: ${stopReason}`)
       } else {
+        // 真正开始执行前通知 UI —— 让用户知道当前停留在哪一步的工具上
+        onToolExecute?.(tc.name, normalizedArgs)
         result = await executeTool(tc.name, normalizedArgs, { ...toolContext, signal })
         recordToolLoopOutcome(toolLoopState, tc.name, fingerprint, result)
       }
       throwIfAborted(signal)
+      // sentMessage 语义：最近一次工具动作是否就是 send_message。
+      // 任何非 send_message 工具都把它清掉——意味着模型在 send_message 之后又做了新工作，
+      // 那之前那次 send_message 只是过场（"好，我去看看…"），还欠用户一次最终回复。
+      // 这样 line ~641 的"沉默退出 nudge"才能在该补刀时正确触发。
       if (tc.name === 'send_message') sentMessage = true
+      else sentMessage = false
       if (shouldPersistActionLog(tc.name)) {
         insertActionLog({
           timestamp: new Date().toISOString(),
