@@ -6,7 +6,7 @@ import { initPanelCollapse } from "./panel-collapse.js";
 import { ThoughtStream } from "./thought-stream.js";
 import { initVoicePanel } from "./voice-panel.js";
 import { initHotspot, toggleHotspot, setHotspotMode, moveVoicePanelToBody, restoreVoicePanel } from "./hotspot.js";
-import { initPersonCard, setPersonCardMode, showPersonCardByName } from "./person-card.js";
+import { enrichVisiblePersonCardFromText, initPersonCard, setPersonCardMode, showPersonCardByName } from "./person-card.js";
 import { initDocPanel, setDocPanelMode } from "./doc.js";
 import { initWechatPopup, showWechatPopup } from "./wechat-popup.js";
 renderBrainUiApp(document.body);
@@ -1260,6 +1260,7 @@ function handle({ type, data = {} }) {
         const viaLabel = friendlyChannelLabel(data.channel);
         const content = viaLabel ? `_→ ${viaLabel}_  \n${data.content}` : data.content;
         addMsg("jarvis", content);
+        enrichVisiblePersonCardFromText(data.content, { source: 'assistant_message' });
         openChat(true);
       }
       break;
@@ -1568,6 +1569,24 @@ d3.timer(() => {
   refreshNodeVisuals();
 });
 
+function extractPersonCardQuery(text = "") {
+  const value = String(text || "").trim();
+  if (!value || /热点|热搜/.test(value)) return "";
+
+  const patterns = [
+    /^谁是\s*([\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z0-9·.\-\s]{1,40})[？?]?$/,
+    /^([\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z0-9·.\-\s]{1,40})\s*(?:是谁|是誰|是什么人|是什麼人|是干嘛的|简介|介绍|资料|履历)[？?]?$/,
+    /^(?:介绍一下|介绍下|查一下|了解一下|认识一下)\s*([\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z0-9·.\-\s]{1,40})[？?]?$/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    const name = match?.[1]?.trim();
+    if (name) return name.replace(/[，,。.!！：:；;]+$/g, "").trim();
+  }
+  return "";
+}
+
 setAgentName(DEFAULT_AGENT_NAME);
 initUiZoom();
 readPhysicsSettings();
@@ -1590,6 +1609,10 @@ chat = initChat({
     }
     if (/热点|热搜/.test(text) && !document.body.classList.contains('hotspot-mode')) {
       toggleHotspot();
+    }
+    const personQuery = extractPersonCardQuery(text);
+    if (personQuery) {
+      showPersonCardByName(personQuery, { source: 'chat_input' });
     }
   },
 });

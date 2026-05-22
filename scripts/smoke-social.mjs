@@ -39,7 +39,11 @@ try {
     },
   })
   const feishuMsg = popMessage()
-  if (feishuMsg?.fromId !== 'feishu:open_id:ou_smoke' || feishuMsg?.content !== 'hello feishu') throw new Error('Feishu message enqueue failed')
+  if (
+    feishuMsg?.externalPartyId !== 'feishu:open_id:ou_smoke'
+    || feishuMsg?.channel !== 'FEISHU'
+    || feishuMsg?.content !== 'hello feishu'
+  ) throw new Error('Feishu message enqueue failed')
 
   const ts = String(Math.floor(Date.now() / 1000))
   const nonce = 'abc'
@@ -53,7 +57,11 @@ try {
     body: '<xml><ToUserName><![CDATA[to]]></ToUserName><FromUserName><![CDATA[from_openid]]></FromUserName><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[hello wechat]]></Content></xml>',
   })
   const wechatMsg = popMessage()
-  if (wechatMsg?.fromId !== 'wechat:official:from_openid' || wechatMsg?.content !== 'hello wechat') throw new Error('WeChat message enqueue failed')
+  if (
+    wechatMsg?.externalPartyId !== 'wechat:official:from_openid'
+    || wechatMsg?.channel !== 'WECHAT_OFFICIAL'
+    || wechatMsg?.content !== 'hello wechat'
+  ) throw new Error('WeChat message enqueue failed')
 
   await fetch(`${base}/social/wecom/webhook`, {
     method: 'POST',
@@ -61,7 +69,11 @@ try {
     body: JSON.stringify({ from_id: 'wecom:webhook:default', content: 'hello wecom' }),
   })
   const wecomMsg = popMessage()
-  if (wecomMsg?.fromId !== 'wecom:webhook:default' || wecomMsg?.content !== 'hello wecom') throw new Error('WeCom message enqueue failed')
+  if (
+    wecomMsg?.externalPartyId !== 'wecom:webhook:default'
+    || wecomMsg?.channel !== 'WECOM'
+    || wecomMsg?.content !== 'hello wecom'
+  ) throw new Error('WeCom message enqueue failed')
 
   console.log('[PASS] social smoke')
 } finally {

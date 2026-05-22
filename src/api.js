@@ -2,7 +2,6 @@
 import fs from 'fs'
 import path from 'path'
 import net from 'net'
-import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 import { WebSocketServer } from 'ws'
 import { pushMessage } from './queue.js'
@@ -955,17 +954,15 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       return
     }
 
-    // POST /admin/restart — restart the Jarvis process (spawn new process then exit)
+    // POST /admin/restart — request a normal Electron relaunch when available.
     if (req.method === 'POST' && url.pathname === '/admin/restart') {
       jsonResponse(res, 200, { ok: true, message: 'Restarting…' })
       setTimeout(() => {
-        const child = spawn('npm', ['start'], {
-          cwd: path.join(__dirname, '../'),
-          detached: true,
-          stdio: 'ignore',
-          shell: true,
-        })
-        child.unref()
+        const restart = globalThis.bailongmaAppControl?.restart
+        if (typeof restart === 'function') {
+          restart()
+          return
+        }
         process.exit(0)
       }, 500)
       return

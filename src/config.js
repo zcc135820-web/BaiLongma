@@ -630,12 +630,22 @@ export function setSocialConfig(updates) {
 
 const VOICE_CONFIG_KEYS = ['aliyunApiKey', 'tencentSecretId', 'tencentSecretKey', 'tencentAppId', 'xunfeiAppId', 'xunfeiApiKey', 'xunfeiApiSecret']
 
+function isValidAliyunAsrKey(value) {
+  return /^sk-[A-Za-z0-9_\-.]{20,}$/.test(String(value || '').trim())
+}
+
 export function getVoiceConfig() {
   let stored = {}
   try { stored = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8'))?.voice || {} } catch {}
   const result = {}
   for (const key of VOICE_CONFIG_KEYS) {
     result[key] = { configured: !!(stored[key]) }
+    if (key === 'aliyunApiKey' && stored[key]) {
+      result[key] = {
+        configured: isValidAliyunAsrKey(stored[key]),
+        invalidFormat: !isValidAliyunAsrKey(stored[key]),
+      }
+    }
   }
   return result
 }
@@ -648,6 +658,10 @@ export function setVoiceConfig(updates) {
   for (const [key, val] of Object.entries(updates)) {
     if (!VOICE_CONFIG_KEYS.includes(key)) continue
     const trimmed = String(val || '').trim()
+    if (key === 'aliyunApiKey' && trimmed && !isValidAliyunAsrKey(trimmed)) {
+      console.warn('[voice-config] Ignoring invalid Aliyun ASR key format; expected DashScope sk-* API key')
+      continue
+    }
     if (trimmed) next[key] = trimmed
     else delete next[key]
   }

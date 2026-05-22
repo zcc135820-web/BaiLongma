@@ -5,8 +5,9 @@ if (process.platform === 'win32') {
   } catch (_) {}
 }
 
-const { app, BrowserWindow, shell, dialog, Menu, ipcMain, globalShortcut, Tray, nativeImage } = require('electron')
+const { app, BrowserWindow, shell, dialog, Menu, ipcMain, Tray, nativeImage } = require('electron')
 const path = require('path')
+const fs = require('fs')
 const net = require('net')
 const http = require('http')
 const { EventEmitter } = require('events')
@@ -20,6 +21,59 @@ const CODE_ROOT = app.getAppPath()
 const RESOURCE_ROOT = CODE_ROOT
 const BACKEND_ENTRY = path.join(CODE_ROOT, 'src', 'index.js')
 
+// 持久化日志：把 console.* 镜像到 USER_DIR/logs/bailongma.log，
+// 安装版没有 stdout 的情况下，卡死/崩溃后还能 tail 这个文件复盘。
+// 简易 rotate：> 5MB 时把当前文件改名 .old（覆盖上一份 .old），下次写入重开。
+const LOG_DIR = path.join(USER_DIR, 'logs')
+const LOG_FILE = path.join(LOG_DIR, 'bailongma.log')
+const LOG_FILE_OLD = path.join(LOG_DIR, 'bailongma.old.log')
+const LOG_MAX_BYTES = 5 * 1024 * 1024
+try { fs.mkdirSync(LOG_DIR, { recursive: true }) } catch {}
+function rotateLogIfNeeded() {
+  try {
+    const stat = fs.statSync(LOG_FILE)
+    if (stat.size > LOG_MAX_BYTES) {
+      try { fs.rmSync(LOG_FILE_OLD, { force: true }) } catch {}
+      try { fs.renameSync(LOG_FILE, LOG_FILE_OLD) } catch {}
+    }
+  } catch {}
+}
+function writeLog(level, args) {
+  let line
+  try {
+    line = args.map(a => {
+      if (typeof a === 'string') return a
+      if (a instanceof Error) return a.stack || a.message
+      try { return JSON.stringify(a) } catch { return String(a) }
+    }).join(' ')
+  } catch { line = '[log-serialize-failed]' }
+  const ts = new Date().toISOString()
+  const out = `${ts} [${level}] ${line}\n`
+  try { fs.appendFileSync(LOG_FILE, out) } catch {}
+}
+// Hijack 一次就够；后端 import 在同一进程，console.* 引用的是同一个 console 对象。
+// 把原始方法存起来，appendFile 失败时仍能输出到 stdout/stderr（开发模式可见）。
+;(function installLogHijack() {
+  const levels = ['log', 'info', 'warn', 'error', 'debug']
+  for (const level of levels) {
+    const original = console[level]?.bind(console) || (() => {})
+    console[level] = (...args) => {
+      try { original(...args) } catch {}
+      try {
+        rotateLogIfNeeded()
+        writeLog(level, args)
+      } catch {}
+    }
+  }
+})()
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason instanceof Error ? (reason.stack || reason.message) : String(reason))
+})
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err?.stack || err?.message || String(err))
+})
+console.log(`[main] Bailongma ${app.getVersion()} starting, logs → ${LOG_FILE}`)
+
 let mainWindow = null
 let backendPort = 0
 let tray = null
@@ -28,6 +82,14 @@ let focusBannerWindow = null
 // 后端通过 global.focusBannerBridge 控制横幅窗口
 const focusBannerBridge = new EventEmitter()
 global.focusBannerBridge = focusBannerBridge
+global.bailongmaAppControl = {
+  restart() {
+    console.log('[main] restart requested')
+    app.isQuiting = true
+    app.relaunch()
+    app.quit()
+  },
+}
 
 if (process.platform === 'win32') {
   app.setAppUserModelId(WINDOWS_APP_USER_MODEL_ID)
@@ -123,10 +185,26 @@ async function createWindow() {
     return false
   })
 
-  // F12 打开开发者工具（调试用）
+  // 窗口级快捷键（不用 globalShortcut，避免劫持其他应用的 F11/Ctrl+R 等）
+  //   F12      → 切换 DevTools
+  //   F11      → 切换全屏
+  //   Ctrl+R   → reload（仅 dev）
   mainWindow.webContents.on('before-input-event', (event, input) => {
-    if (input.key === 'F12' && input.type === 'keyDown') {
+    if (input.type !== 'keyDown') return
+    if (input.key === 'F12') {
       mainWindow.webContents.toggleDevTools()
+      event.preventDefault()
+      return
+    }
+    if (input.key === 'F11') {
+      mainWindow.setFullScreen(!mainWindow.isFullScreen())
+      event.preventDefault()
+      return
+    }
+    if (IS_DEV && (input.control || input.meta) && input.key.toLowerCase() === 'r') {
+      mainWindow.webContents.reload()
+      event.preventDefault()
+      return
     }
   })
 
@@ -396,22 +474,7 @@ app.whenReady().then(async () => {
   await createWindow()
   setupTray()
   setupAutoUpdater()
-
-  // F11 切换全屏
-  globalShortcut.register('F11', () => {
-    if (!mainWindow || mainWindow.isDestroyed()) return
-    mainWindow.setFullScreen(!mainWindow.isFullScreen())
-  })
-
-  // 开发快捷键
-  if (IS_DEV) {
-    globalShortcut.register('F12', () => {
-      if (!mainWindow || mainWindow.isDestroyed()) return
-      mainWindow.webContents.toggleDevTools()
-    })
-    globalShortcut.register('CommandOrControl+R', () => {
-      if (!mainWindow || mainWindow.isDestroyed()) return
-      mainWindow.webContents.reload()
-    })
-  }
+  // 不再注册任何系统级 globalShortcut；F11 / F12 / Ctrl+R 已由 mainWindow
+  // 的 before-input-event 处理（见 createWindow），只在窗口获焦时生效，
+  // 不会劫持浏览器/IDE 等其他应用的同键操作。
 })

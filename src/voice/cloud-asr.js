@@ -90,6 +90,10 @@ function createAliyunSession(apiKey, lang, onTranscript, onError, onClose) {
   }
 }
 
+function isValidAliyunAsrKey(value) {
+  return /^sk-[A-Za-z0-9_\-.]{20,}$/.test(String(value || '').trim())
+}
+
 // ─── 腾讯云 ASR ───
 // 签名：HMAC-SHA256(SecretKey, host+path+?+sorted_query) → base64 → URL 参数
 // 结果：{code:0, result:{slice_type:0|2, ...}}，slice_type=2 为最终结果
@@ -226,6 +230,10 @@ export function createCloudASRSession(config, onTranscript, onError, onClose) {
 
   if (provider === 'aliyun') {
     if (!config.aliyunApiKey) { onError('未配置阿里云 API Key'); return null }
+    if (!isValidAliyunAsrKey(config.aliyunApiKey)) {
+      onError('阿里云 ASR Key 格式不正确：请填写百炼/DashScope 控制台的 sk- 开头 API Key')
+      return null
+    }
     return createAliyunSession(config.aliyunApiKey, lang, onTranscript, onError, onClose)
   }
 

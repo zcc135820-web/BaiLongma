@@ -21,6 +21,10 @@ function isKeyOnlyMessage(text) {
   return /^[\s\n]*[A-Za-z0-9\-_\.]{20,120}[\s\n]*$/.test(text)
 }
 
+function isValidAliyunAsrKey(key) {
+  return /^sk-[A-Za-z0-9_\-.]{20,}$/.test(String(key || '').trim())
+}
+
 // 所有服务商的检测规则（按出现在消息中的关键词位置匹配）
 const PROVIDER_RULES = [
   // TTS
@@ -229,6 +233,10 @@ export async function tryAutoConfigureKey(text, recentContext = '') {
   // ASR：直接配置
   const asrUpdates = {}
   for (const info of asrInfos) {
+    if (info.provider === 'aliyun' && !isValidAliyunAsrKey(info.configUpdates?.aliyunApiKey)) {
+      failErrors.push('阿里云 ASR: 请使用百炼/DashScope API Key（sk- 开头），不要使用 AccessKey ID/Secret 或实例 ID')
+      continue
+    }
     Object.assign(asrUpdates, info.configUpdates)
     anySuccess = true
   }

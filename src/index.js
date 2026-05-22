@@ -70,6 +70,12 @@ await loadInstalledTools()
 let currentAbortController = null
 let currentExecution = null
 
+// Watchdog：单轮 runTurn 超过这个时间未返回视为卡死（最可能是 fetch/LLM stream/三方网络调用
+// 没传 AbortSignal 也没自己超时）。触发后强 abort，把 processing 清掉，主循环能继续
+// 处理后续消息。不修复挂着的 promise（它会留在内存里直到 GC 或自行结束），但保证 UI
+// "思考中"永远在有限时间内解锁、用户的下一句话能被正常处理。
+const RUN_TURN_WATCHDOG_MS = 180_000
+
 const PRIORITY = {
   tick: 10,
   background: 50,
@@ -151,9 +157,8 @@ if (persistedTask) {
 }
 
 // Register provider (MiniMax handles multimedia capabilities, independent of the LLM choice).
-// The `function process(...)` defined later in this file shadows the global, so use globalThis.process for env vars.
 function registerMinimaxIfAvailable() {
-  const envKey = globalThis.process.env.MINIMAX_API_KEY
+  const envKey = process.env.MINIMAX_API_KEY
   const configKey = config.provider === 'minimax' ? config.apiKey : null
   const storedKey = _getMinimaxKey()
   const key = envKey || configKey || storedKey
@@ -775,7 +780,7 @@ function buildSystemEnv(msg) {
   return blocks.filter(Boolean).join('\n\n')
 }
 
-async function process(input, label, msg = null) {
+async function runTurn(input, label, msg = null) {
   const sessionRef = newSessionRef()
   const isTick = !msg
   if (isTick) state.tickCounter += 1
@@ -1364,6 +1369,32 @@ let processing = false
 let lastTickAborted = false
 let currentTimer = null  // timer for the next pending tick; can be cleared by pushMessage to run immediately
 
+// 把 runTurn 用 watchdog 包一层：超时 → 强 abort + reject，让 onTick 的 finally 能跑、
+// processing 清掉。runTurn 内部那个永远不 resolve 的 promise 留在后台，最终被 GC。
+async function runTurnWithWatchdog(input, label, msg) {
+  let timer = null
+  const watchdog = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const stuckLabel = currentExecution?.label || label
+      const elapsedS = currentExecution ? Math.round((Date.now() - currentExecution.startedAt) / 1000) : null
+      console.error(`[watchdog] runTurn 卡死 ${RUN_TURN_WATCHDOG_MS / 1000}s 未返回 (label=${stuckLabel}, elapsed=${elapsedS}s)，强制 abort`)
+      try { currentAbortController?.abort?.('watchdog timeout') } catch {}
+      // 立即清掉全局 execution 引用，避免后续 message 进来还 abort 同一个 controller
+      currentAbortController = null
+      currentExecution = null
+      try { emitEvent('error', { label: 'watchdog', error: `runTurn stuck > ${RUN_TURN_WATCHDOG_MS / 1000}s` }) } catch {}
+      const err = new Error('runTurn watchdog timeout')
+      err.name = 'WatchdogTimeoutError'
+      reject(err)
+    }, RUN_TURN_WATCHDOG_MS)
+  })
+  try {
+    await Promise.race([runTurn(input, label, msg), watchdog])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 async function onTick() {
   if (processing) return
   processing = true
@@ -1376,12 +1407,20 @@ async function onTick() {
     if (hasMessages()) {
       const msg = popMessage()
       const lane = msg.queueName === 'background' ? 'BG' : 'L1'
-      await process(msg.raw, `${lane} message from ${msg.fromId}`, msg)
+      await runTurnWithWatchdog(msg.raw, `${lane} message from ${msg.fromId}`, msg)
     } else {
       autoTick = true
       selfCheckActiveAtStart = !!state.startupSelfCheck?.active
       const tick = formatTick()
-      await process(tick, 'L2 TICK')
+      await runTurnWithWatchdog(tick, 'L2 TICK', null)
+    }
+  } catch (err) {
+    // runTurn 抛错（含 watchdog 超时和 runTurn 内部 LLM 之后未捕获的异常）必须吞掉，
+    // 否则会冒泡到 setTimeout 回调外层，绕过 scheduleNextTick → 主循环停摆。
+    if (err?.name === 'WatchdogTimeoutError') {
+      lastTickAborted = true
+    } else {
+      console.error('[onTick] runTurn 抛出未处理异常:', err?.stack || err?.message || err)
     }
   } finally {
     processing = false
@@ -1455,8 +1494,15 @@ function scheduleNextTick() {
   emitEvent('quota', { ...quota, nextTickMs: interval, ticker: getTickerStatus(), queue: queueSnapshot })
   currentTimer = setTimeout(async () => {
     currentTimer = null
-    await onTick()
-    scheduleNextTick()
+    // try/finally 兜底：即使 onTick 抛错（理论上 onTick 自己已 catch，watchdog 也吞了
+    // 异常），也保证 scheduleNextTick 总被调用，主循环不会因为单轮异常永久停摆。
+    try {
+      await onTick()
+    } catch (err) {
+      console.error('[scheduleNextTick] onTick threw:', err?.stack || err?.message || err)
+    } finally {
+      scheduleNextTick()
+    }
   }, interval)
 }
 
@@ -1468,8 +1514,13 @@ function triggerImmediateTick() {
   if (currentTimer) { clearTimeout(currentTimer); currentTimer = null }
   // 异步启动一轮，不等结果
   ;(async () => {
-    await onTick()
-    scheduleNextTick()
+    try {
+      await onTick()
+    } catch (err) {
+      console.error('[triggerImmediateTick] onTick threw:', err?.stack || err?.message || err)
+    } finally {
+      scheduleNextTick()
+    }
   })()
 }
 
@@ -1538,7 +1589,7 @@ async function main() {
   }
 
   // Start HTTP API — must start regardless of activation status; the activation page depends on it
-  const apiPort = Number(globalThis.process.env.BAILONGMA_PORT) || 3721
+  const apiPort = Number(process.env.BAILONGMA_PORT) || 3721
   startAPI(apiPort, {
     getStateSnapshot: () => ({
       action: state.action,

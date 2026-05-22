@@ -371,6 +371,7 @@ function shouldPersistActionLog(toolName) {
 
 const TOOL_LOOP_LIMITS = {
   maxRounds: 100,
+  maxTotalCalls: 30,
   maxConsecutiveFailures: 3,
   maxSameFailures: 2,
   loopWindowSize: 8,
@@ -438,14 +439,22 @@ function isToolFailure(result) {
 
 function createToolLoopState() {
   return {
+    totalCalls: 0,
     consecutiveFailures: 0,
     sameFailureCounts: new Map(),
     recentFingerprints: [],
   }
 }
 
+// send_message/express 是 agent 向用户"汇报 blocker"的唯一通道，必须绕开跨工具的全局熔断计数。
+// 否则当 exec_command/fetch_url 等连续失败触发熔断后，agent 想 send_message 解释失败也会被一并挡掉，
+// 出现"工具调不动 + 嘴也被堵住"的死锁（lessons-bailongma-silent-exit 的镜像问题）。
+// 同指纹反复失败仍由 sameFailureCounts / recentFingerprints 拦截，安全网完好。
+const REPORT_CHANNEL_TOOLS = new Set(['send_message', 'express'])
+
 function getToolLoopStopReason(state, name, fingerprint) {
-  if (state.consecutiveFailures >= TOOL_LOOP_LIMITS.maxConsecutiveFailures) {
+  const isReportChannel = REPORT_CHANNEL_TOOLS.has(name)
+  if (!isReportChannel && state.consecutiveFailures >= TOOL_LOOP_LIMITS.maxConsecutiveFailures) {
     return `too many consecutive tool failures (${TOOL_LOOP_LIMITS.maxConsecutiveFailures})`
   }
   const sameFailures = state.sameFailureCounts.get(fingerprint) || 0
@@ -453,7 +462,7 @@ function getToolLoopStopReason(state, name, fingerprint) {
     return `same failing action repeated ${sameFailures} times`
   }
   const window = state.recentFingerprints.slice(-TOOL_LOOP_LIMITS.loopWindowSize)
-  if (window.length >= TOOL_LOOP_LIMITS.loopWindowSize) {
+  if (!isReportChannel && window.length >= TOOL_LOOP_LIMITS.loopWindowSize) {
     const unique = new Set(window).size
     if (unique <= TOOL_LOOP_LIMITS.loopUniqueThreshold) {
       return `stuck in a loop (only ${unique} unique action(s) in last ${TOOL_LOOP_LIMITS.loopWindowSize} calls)`
@@ -473,6 +482,7 @@ function makeToolLoopStoppedResult(name, reason) {
 }
 
 function recordToolLoopOutcome(state, name, fingerprint, result) {
+  state.totalCalls += 1
   state.recentFingerprints.push(fingerprint)
 
   if (isToolFailure(result)) {
@@ -680,6 +690,10 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
       if (stopReason) {
         result = makeToolLoopStoppedResult(tc.name, stopReason)
         console.log(`[工具熔断] ${tc.name}: ${stopReason}`)
+        // 熔断信号已经回传给模型，重置跨工具的全局连续失败计数，让 agent 有机会切换到完全不同的工具
+        // （比如换 read_file 查日志、search_memory 找历史经验）。同指纹反复失败仍由 sameFailureCounts
+        // 拦截，跨工具死循环仍由 recentFingerprints 的 unique threshold 拦截——安全网未失效。
+        toolLoopState.consecutiveFailures = 0
       } else {
         // 真正开始执行前通知 UI —— 让用户知道当前停留在哪一步的工具上
         onToolExecute?.(tc.name, normalizedArgs)

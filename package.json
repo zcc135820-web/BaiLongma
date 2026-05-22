@@ -1,7 +1,7 @@
 {
   "name": "bailongma",
   "productName": "Bailongma",
-  "version": "2.1.171",
+  "version": "2.1.179",
   "description": "A continuously running digital consciousness framework",
   "type": "module",
   "main": "electron/main.cjs",
@@ -26,14 +26,14 @@
     "d3": "^7.9.0",
     "electron-updater": "^6.3.9",
     "openai": "^6.34.0",
-    "playwright": "^1.59.1",
     "wechat-ilink-client": "^0.1.0",
-    "ws": "^8.20.0"
+    "ws": "^8.20.1"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.4",
     "electron": "^33.2.0",
-    "electron-builder": "^25.1.8"
+    "electron-builder": "^25.1.8",
+    "playwright": "^1.59.1"
   },
   "build": {
     "appId": "com.xiaoyuanda.bailongma",
@@ -43,8 +43,6 @@
     "asar": true,
     "asarUnpack": [
       "**/node_modules/better-sqlite3/**",
-      "**/node_modules/playwright/**",
-      "**/node_modules/playwright-core/**",
       "src/voice/**"
     ],
     "files": [
@@ -64,6 +62,11 @@
       "music/**/*",
       "package.json",
       "!**/*.map",
+      "!src/test-*",
+      "!src/**/test-*",
+      "!scripts/smoke-*.mjs",
+      "!src/**/__pycache__/**",
+      "!src/**/*.pyc",
       "!**/node_modules/*/{CHANGELOG.md,README.md,readme.md,*.d.ts}",
       "!**/node_modules/.cache",
       "!**/.vscode",

@@ -30,6 +30,34 @@ function cleanLine(value = '') {
     .trim();
 }
 
+function extractKnownForFromText(text = '') {
+  const value = cleanLine(text);
+  const items = [];
+  const patterns = [
+    /(?:创办了|创建了|创立了|代表作(?:包括|有)?|作品(?:包括|有)?|known for[:：]?)\s*([^。.!！？；;]+)/gi,
+    /(?:创始人|创办人|联合创始人)/gi,
+  ];
+
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(value))) {
+      if (!match[1]) {
+        const sentenceStart = Math.max(0, value.lastIndexOf('，', match.index) + 1);
+        items.push(value.slice(sentenceStart, pattern.lastIndex));
+        continue;
+      }
+      items.push(
+        ...match[1]
+          .split(/[,，、/和及与]|以及/)
+          .map(part => cleanLine(part).replace(/^(?:了|的)\s*/, ''))
+          .filter(Boolean),
+      );
+    }
+  }
+
+  return uniqueList(items).slice(0, 6);
+}
+
 function formatUpdatedAt(value) {
   if (!value) return '--';
   const date = new Date(value);
@@ -207,6 +235,26 @@ export function setPersonCardMode(visible, { source = 'brain-ui', card = null } 
     }
     reportPersonCardState(true, source, currentCard);
   }, PERSON_CARD_REVEAL_DELAY_MS);
+}
+
+export function enrichVisiblePersonCardFromText(text, { source = 'assistant_summary' } = {}) {
+  if (!personCardActive || !currentCard) return false;
+  const summary = cleanLine(text).slice(0, 260);
+  if (!summary) return false;
+
+  const knownFor = uniqueList([
+    ...normalizeList(currentCard.knownFor),
+    ...extractKnownForFromText(summary),
+  ]);
+  renderPersonCard({
+    ...currentCard,
+    summary,
+    knownFor,
+    source: currentCard.source === 'fallback' ? 'assistant' : currentCard.source,
+    updatedAt: new Date().toISOString(),
+  });
+  reportPersonCardState(true, source, currentCard);
+  return true;
 }
 
 export function togglePersonCard(source = 'brain-ui') {

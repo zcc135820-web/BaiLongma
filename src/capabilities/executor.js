@@ -3,7 +3,6 @@ import path from 'path'
 import crypto from 'crypto'
 import { fileURLToPath } from 'url'
 import { spawn } from 'child_process'
-import { chromium } from 'playwright'
 import { nowTimestamp } from '../time.js'
 import { searchMemories, searchMemoriesByKeywords, insertMemory, upsertMemoryByMemId, memoryExistsByMemId, getMemoryByMemId, deleteMemoryByMemId, hideMemoryByMemId, normalizeConversationPartyId, createReminder, findMergeableOneOffReminder, appendReminderTask, listPendingReminders, getReminderById, cancelReminder, upsertPrefetchTask, removePrefetchTask, listPrefetchTasks, insertActionLog, insertConversation, upsertMusicTrack, getMusicTrack, searchMusicLibrary, listMusicLibrary, updateMusicLrc, deleteMusicTrack as dbDeleteMusicTrack, setConfig as dbSetConfig } from '../db.js'
 import { emitEvent, emitUICommand, emitACUIEvent, hasACUIClient, addActiveUICard, removeActiveUICard, getActiveUICards, setStickyEvent } from '../events.js'
@@ -28,17 +27,31 @@ const IS_WIN = process.platform === 'win32'
 /**
  * 跨平台 spawn shell 命令，确保中文输出不乱码。
  *
- * Windows：用 powershell.exe，并在命令前注入 UTF-8 编码设置，
- *          防止中文 Windows 默认 GBK 输出被 Node 按 UTF-8 解码成 �。
- * 其他平台：原样用 shell:true（系统默认 /bin/sh，本来就是 UTF-8）。
+ * Windows 编码三层同步（缺一不可，否则中文会乱码）：
+ *   1) chcp 65001  → 切换控制台 Active Code Page 到 UTF-8。这一步最关键：
+ *      原生程序（git / npm / node / cmd 内建命令 / yt-dlp 等）读取的是 ACP，
+ *      不读 PowerShell 的 OutputEncoding。中文 Windows 默认 ACP=936(GBK)，
+ *      不切的话原生命令吐 GBK 字节，下游按 UTF-8 解码就是 �。
+ *   2) [Console]::OutputEncoding=UTF8  → 告诉 PowerShell 按 UTF-8 解码原生命令输出。
+ *   3) [Console]::InputEncoding / $OutputEncoding=UTF8  → PowerShell 自身、
+ *      以及向子进程 stdin 写数据的方向也用 UTF-8。
  *
- * 调用方还应对返回的 child.stdout / child.stderr 调用 setEncoding('utf8')，
- * 防止数据 chunk 切在多字节字符中间产生 U+FFFD 替换字符。
+ * 不通过 Node 的 shell: 'powershell.exe' 选项，避免 Windows 下被强行套上
+ * cmd /d /s /c 包装（PowerShell 会把这些当作未知参数，特殊字符还可能二次转义）。
+ * 直接显式 spawn powershell.exe + -Command 最可控。
+ *
+ * 调用方仍应对 child.stdout / child.stderr 调用 setEncoding('utf8')，
+ * 防止数据 chunk 切在多字节字符中间产生 U+FFFD。
  */
 function spawnShellCommand(command, opts = {}) {
   if (IS_WIN) {
-    const wrapped = `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $OutputEncoding=[System.Text.Encoding]::UTF8; ${command}`
-    return spawn(wrapped, { ...opts, shell: 'powershell.exe' })
+    const wrapped =
+      `chcp 65001 > $null; ` +
+      `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; ` +
+      `[Console]::InputEncoding=[System.Text.Encoding]::UTF8; ` +
+      `$OutputEncoding=[System.Text.Encoding]::UTF8; ` +
+      command
+    return spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-Command', wrapped], opts)
   }
   return spawn(command, { ...opts, shell: true })
 }
@@ -1336,6 +1349,7 @@ function readWebConfig() {
 // 单例浏览器：避免每次 browser_read 冷启动 Chromium（耗时 3~5 秒）
 let _sharedBrowser = null
 let _sharedBrowserLastUsed = 0
+let _playwrightChromium = null
 const BROWSER_IDLE_TIMEOUT_MS = 10 * 60 * 1000  // 闲置 10 分钟后关掉
 
 async function getSharedBrowser() {
@@ -1455,6 +1469,7 @@ function saveLongArticle({ url, finalUrl, title, body, source }) {
 }
 
 async function launchReadableBrowser() {
+  const chromium = await getPlaywrightChromium()
   const launchOptions = { headless: true }
   try {
     return await chromium.launch(launchOptions)
@@ -1465,6 +1480,17 @@ async function launchReadableBrowser() {
       } catch {}
     }
     throw firstError
+  }
+}
+
+async function getPlaywrightChromium() {
+  if (_playwrightChromium) return _playwrightChromium
+  try {
+    const mod = await import('playwright')
+    _playwrightChromium = mod.chromium
+    return _playwrightChromium
+  } catch (err) {
+    throw new Error(`Playwright is not bundled in this build: ${err.message || String(err)}`)
   }
 }
 
@@ -2601,14 +2627,45 @@ async function fetchLrcFromNet(title, artist) {
   return null
 }
 
-function runCommand(cmd, cwd) {
+function decodeProcessOutput(chunks) {
+  const buffer = Buffer.concat(chunks)
+  if (buffer.length === 0) return ''
+
+  const utf8 = new TextDecoder('utf-8', { fatal: false }).decode(buffer)
+  if (!utf8.includes('\uFFFD') || !IS_WIN) return utf8
+
+  try {
+    return new TextDecoder('gb18030', { fatal: false }).decode(buffer)
+  } catch {
+    return utf8
+  }
+}
+
+function runProcess(file, args = [], cwd) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, { shell: true, cwd: cwd || paths.musicDir })
-    let stdout = '', stderr = ''
-    child.stdout.on('data', d => { stdout += d.toString() })
-    child.stderr.on('data', d => { stderr += d.toString() })
-    child.on('close', code => resolve({ code, stdout, stderr }))
-    child.on('error', err => resolve({ code: -1, stdout, stderr: err.message }))
+    const child = spawn(file, args, {
+      cwd: cwd || paths.musicDir,
+      windowsHide: true,
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: 'utf-8',
+        PYTHONUTF8: '1',
+      },
+    })
+    const stdoutChunks = []
+    const stderrChunks = []
+    child.stdout?.on('data', d => { stdoutChunks.push(Buffer.from(d)) })
+    child.stderr?.on('data', d => { stderrChunks.push(Buffer.from(d)) })
+    child.on('close', code => resolve({
+      code,
+      stdout: decodeProcessOutput(stdoutChunks),
+      stderr: decodeProcessOutput(stderrChunks),
+    }))
+    child.on('error', err => resolve({
+      code: -1,
+      stdout: decodeProcessOutput(stdoutChunks),
+      stderr: err.message,
+    }))
   })
 }
 
@@ -2617,13 +2674,13 @@ const YTDLP_URL   = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/y
 
 async function resolveYtDlp() {
   // 1. 系统 PATH 里有就直接用
-  const sys = await runCommand('yt-dlp --version', paths.musicDir)
+  const sys = await runProcess('yt-dlp', ['--version'], paths.musicDir)
   if (sys.code === 0) return 'yt-dlp'
 
   // 2. music 目录里有本地副本就用它
   if (fs.existsSync(YTDLP_LOCAL)) {
-    const local = await runCommand(`"${YTDLP_LOCAL}" --version`, paths.musicDir)
-    if (local.code === 0) return `"${YTDLP_LOCAL}"`
+    const local = await runProcess(YTDLP_LOCAL, ['--version'], paths.musicDir)
+    if (local.code === 0) return YTDLP_LOCAL
   }
 
   // 3. 自动下载 yt-dlp.exe 到 music 目录
@@ -2633,7 +2690,7 @@ async function resolveYtDlp() {
   const buf = Buffer.from(await res.arrayBuffer())
   fs.writeFileSync(YTDLP_LOCAL, buf)
   fs.chmodSync(YTDLP_LOCAL, 0o755)
-  return `"${YTDLP_LOCAL}"`
+  return YTDLP_LOCAL
 }
 
 async function execMusic(args = {}) {
@@ -2698,12 +2755,12 @@ async function execMusic(args = {}) {
 
     // Download: print final filepath after conversion
     const outTemplate = path.join(musicDir, '%(title)s.%(ext)s').replace(/\\/g, '/')
-    const dlBase = `${ytdlp} -x --audio-format mp3 --audio-quality 192K --no-playlist --print after_move:filepath -o "${outTemplate}"`
-    let result = await runCommand(`${dlBase} "${url}"`)
+    const dlArgs = ['-x', '--audio-format', 'mp3', '--audio-quality', '192K', '--no-playlist', '--print', 'after_move:filepath', '-o', outTemplate]
+    let result = await runProcess(ytdlp, [...dlArgs, url])
 
     // SSL 握手失败时降级：加 --no-check-certificates 重试一次
     if (result.code !== 0 && /ssl|EOF occurred in violation of protocol/i.test(result.stderr)) {
-      result = await runCommand(`${dlBase} --no-check-certificates "${url}"`)
+      result = await runProcess(ytdlp, [...dlArgs, '--no-check-certificates', url])
     }
 
     if (result.code !== 0) {

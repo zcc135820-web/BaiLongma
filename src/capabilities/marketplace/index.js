@@ -1,7 +1,9 @@
 import fs from 'fs'
 import path from 'path'
-import { execSync } from 'child_process'
+import { execSync, execFileSync } from 'child_process'
 import { paths } from '../../paths.js'
+
+const IS_WIN = process.platform === 'win32'
 
 const TOOLS_DIR = path.join(paths.sandboxDir, 'installed_tools')
 
@@ -40,11 +42,24 @@ function buildHelpers() {
 
     exec: (command, opts = {}) => {
       try {
-        return execSync(command, {
+        const execOpts = {
           encoding: 'utf-8',
           timeout: opts.timeout ?? 30_000,
           maxBuffer: 2 * 1024 * 1024,
-        })
+          windowsHide: true,
+        }
+        if (IS_WIN) {
+          // 走 PowerShell 显式调用，并三层同步 UTF-8 编码（chcp + OutputEncoding + InputEncoding），
+          // 避免中文 Windows 默认 GBK 代码页让原生命令输出被按 UTF-8 解码成乱码。
+          const wrapped =
+            `chcp 65001 > $null; ` +
+            `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; ` +
+            `[Console]::InputEncoding=[System.Text.Encoding]::UTF8; ` +
+            `$OutputEncoding=[System.Text.Encoding]::UTF8; ` +
+            command
+          return execFileSync('powershell.exe', ['-NoLogo', '-NoProfile', '-Command', wrapped], execOpts)
+        }
+        return execSync(command, execOpts)
       } catch (err) {
         return `Error: ${err.message}`
       }

@@ -15,6 +15,7 @@ export async function startDiscordConnector({ pushMessage, emitEvent }) {
   let heartbeatTimer = null
   let heartbeatAckTimer = null
   let reconnectTimer = null
+  let initialHeartbeatTimer = null
   let reconnectAttempt = 0
   let seq = null
   let sessionId = null
@@ -25,6 +26,7 @@ export async function startDiscordConnector({ pushMessage, emitEvent }) {
     if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null }
     if (heartbeatAckTimer) { clearTimeout(heartbeatAckTimer); heartbeatAckTimer = null }
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+    if (initialHeartbeatTimer) { clearTimeout(initialHeartbeatTimer); initialHeartbeatTimer = null }
   }
 
   async function getGatewayUrl() {
@@ -51,6 +53,11 @@ export async function startDiscordConnector({ pushMessage, emitEvent }) {
   }
 
   function startHeartbeat(interval) {
+    // 防御性：上一个心跳 interval 若没清掉（比如初始 jitter setTimeout 与重连 Hello
+    // 撞车），先清掉再起新的，避免两个 setInterval 并行抢 heartbeatAckPending 标志，
+    // 触发假阳性 zombie 检测。
+    if (heartbeatTimer) clearInterval(heartbeatTimer)
+    heartbeatAckPending = false
     heartbeatTimer = setInterval(() => {
       if (heartbeatAckPending) {
         // 上一次心跳没收到 ACK，连接是僵尸，强制断开重连
@@ -88,10 +95,15 @@ export async function startDiscordConnector({ pushMessage, emitEvent }) {
         // op 10: Hello — 启动心跳，然后 IDENTIFY 或 RESUME
         if (msg.op === 10) {
           const interval = msg.d?.heartbeat_interval || 45000
-          // 初始心跳加随机抖动，避免所有客户端同步发包
-          setTimeout(() => {
+          // 初始心跳加随机抖动，避免所有客户端同步发包。
+          // 记录 timer 以便 clearTimers() 能在重连/断开时清掉它，
+          // 否则它会在新连接已建立后再触发一次 startHeartbeat，引发双心跳。
+          if (initialHeartbeatTimer) clearTimeout(initialHeartbeatTimer)
+          initialHeartbeatTimer = setTimeout(() => {
+            initialHeartbeatTimer = null
             startHeartbeat(interval)
           }, Math.floor(Math.random() * interval))
+          initialHeartbeatTimer.unref?.()
 
           if (sessionId && seq && !fresh) {
             sendWs({ op: 6, d: { token, session_id: sessionId, seq } })
