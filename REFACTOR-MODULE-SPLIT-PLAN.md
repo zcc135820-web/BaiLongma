@@ -30,16 +30,24 @@
   - `src/capabilities/tools/web.js`
   - 包含 `web_search`、`fetch_url`、`browser_read`
   - 包含 URL 缓存/TTL、`searchCache`、web config 短缓存、网页正文保存到 `sandbox/articles`、搜索 provider/fallback、Playwright/Chromium 读取逻辑
+- Memory 工具域拆分：
+  - `src/capabilities/tools/memory.js`
+  - 包含 `search_memory`、`upsert_memory`、`merge_memories`、`recall_memory`、`downgrade_memory`、`skip_consolidation`、`skip_recognition`
+  - 已迁移记忆参数 JSON 兼容解析、识别器/记忆写入辅助逻辑、`memory_consolidated` 事件和相关 `db.js` 记忆函数 import
 - `src/capabilities/executor.js` 继续保留工具调度门面和对外入口：
   - `executeTool`
   - `autoSpeakForVoiceReply`
   - `persistAppState`
-- 版本已升到 `2.1.186`
+- 版本已升到 `2.1.187`
 - 已 build 并验证安装包：
-  - `dist/Bailongma-Setup-2.1.186.exe`
+  - `dist/Bailongma-Setup-2.1.187.exe`
 - 已推送：
-  - commit `e96746a`
+  - commit `03ddaf8`
   - branch `origin/refactor/module-split`
+- 当前本地未提交改动：
+  - memory 工具域拆分
+  - 版本号 `2.1.187`
+  - 新安装包已生成并验证
 
 ## 已验证
 
@@ -48,6 +56,9 @@
 - `npm run smoke:tools`：6/6 passed
 - `npm run smoke:brain-ui`：passed
 - 本地 mock `executeTool('fetch_url', ...)` 调用通过
+- Electron Node 路径下最小 memory 工具调用通过：
+  - `executeTool('search_memory', { keywords: '["BaiLongma"]' })`
+  - `executeTool('skip_recognition', { reason: 'syntax check' })`
 - 标准 build 脚本成功，packaged/installed `better-sqlite3` 均为 Electron ABI 130
 - 安装版 `/status` HTTP 200
 - 安装版真实链路验证通过：
@@ -66,11 +77,10 @@
 
 ### 1. `src/capabilities/executor.js`
 
-当前状态：已拆出基础 helper、文件工具域、shell 工具域、web 工具域；`executor.js` 仍保留工具调度入口和大量其他工具实现。
+当前状态：已拆出基础 helper、文件工具域、shell 工具域、web 工具域、memory 工具域；`executor.js` 仍保留工具调度入口和大量其他工具实现。
 
 剩余建议拆分顺序：
 
-- `src/capabilities/tools/memory.js`：`search_memory`、`upsert_memory`、`merge_memories`、`recall_memory`、记忆 JSON 兼容解析、识别器相关辅助逻辑。
 - `src/capabilities/tools/reminders.js`：`schedule_reminder`、`manage_reminder`、周期提醒时间解析、下一次触发时间计算。
 - `src/capabilities/tools/media.js`：`speak`、`generate_lyrics`、`generate_music`、`music`、`generate_image`。
 - `src/capabilities/tools/ui.js`：`ui_show`、`ui_update`、`ui_hide`、`ui_patch`、`manage_app`、`ui_register`、ACUI/组件草稿相关逻辑。
@@ -78,7 +88,7 @@
 - `src/capabilities/tools/delegation.js`：Agent 委托相关工具。
 - 后续可考虑 `src/capabilities/tool-registry.js`，把工具名到 handler 的 switch/注册表进一步拆出。
 
-下一步建议：优先拆 `memory.js`。它边界相对清晰，但与 `db.js`、识别器写入、记忆检索返回 shape 强相关，必须保持文本/JSON 返回格式、错误文案和审计行为不变。
+下一步建议：优先拆 `reminders.js`。它边界相对清晰，但与 `db.js`、时间解析、周期提醒、`reminder_created` 事件和目标用户解析强相关，必须保持文本/JSON 返回格式、错误文案、事件名和现有调度行为不变。
 
 ### 2. `src/api.js`
 
