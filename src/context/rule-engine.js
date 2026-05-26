@@ -1,4 +1,5 @@
 import { getLocalResourcesBlock } from '../local-resources-scanner.js'
+import { getInstalledSoftwareBlock } from '../installed-software-scanner.js'
 import { buildWeatherRuntimeContext } from '../weather.js'
 import { loadContextRules } from './rule-store.js'
 
@@ -21,6 +22,13 @@ async function providerBlock(rule, text) {
 
 This block was injected because the current message matched a local-resource rule. Use it to act without asking for credentials, but do not quote hostnames, IP addresses, key names, or connection details back to the user unless they explicitly ask for those exact details.`
   }
+  if (rule.provider === 'installed_software') {
+    const block = getInstalledSoftwareBlock()
+    if (!block) return ''
+    return `${block}
+
+This block was injected because the current message mentioned software, apps, clients, VPN/proxy tools, or a likely local application. Use it as local evidence before guessing.`
+  }
   if (rule.provider === 'static_text') {
     return String(rule.context || rule.action?.context || '').trim()
   }
@@ -31,7 +39,7 @@ This block was injected because the current message matched a local-resource rul
 }
 
 function shouldDedupeProvider(provider = '') {
-  return ['local_resources', 'weather'].includes(provider)
+  return ['local_resources', 'installed_software', 'weather'].includes(provider)
 }
 
 export async function runContextRuleEngine(message = '') {

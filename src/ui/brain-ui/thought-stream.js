@@ -135,6 +135,7 @@ export class ThoughtStream {
     this.thinkingEl = null;
     this.lastToolEl = null;
     this.statusEl = null;
+    this.statusTimer = null;
     this.hadToolCall = false;
     this.toolFailed = false;
   }
@@ -200,6 +201,7 @@ export class ThoughtStream {
   }
 
   setStatus(text, kind = "busy") {
+    this.clearStatusTimer();
     if (!this.curLine) this.newLine(this.thinkingLabel);
     const header = this.curLine.querySelector(".line-header");
     if (!header) return;
@@ -213,7 +215,28 @@ export class ThoughtStream {
     this.statusEl.textContent = text;
   }
 
+  setTimedStatus(text, kind = "busy", options = {}) {
+    this.setStatus(text, kind);
+    const staleAfterMs = Number(options.staleAfterMs || 0);
+    if (!staleAfterMs) return;
+    const statusEl = this.statusEl;
+    const staleText = options.staleText || text;
+    this.statusTimer = setTimeout(() => {
+      if (!statusEl || statusEl !== this.statusEl || !statusEl.parentElement) return;
+      statusEl.className = "line-status stale";
+      statusEl.textContent = staleText;
+    }, staleAfterMs);
+  }
+
+  clearStatusTimer() {
+    if (this.statusTimer) {
+      clearTimeout(this.statusTimer);
+      this.statusTimer = null;
+    }
+  }
+
   clearStatus() {
+    this.clearStatusTimer();
     if (this.statusEl && this.statusEl.parentElement) {
       this.statusEl.remove();
     }
@@ -581,6 +604,7 @@ export class ThoughtStream {
   }
 
   finalizeLastTool() {
+    this.clearStatusTimer();
     if (this.lastToolEl) {
       this.lastToolEl.classList.add("done");
       this.lastToolEl = null;
@@ -708,4 +732,3 @@ export class ThoughtStream {
     this.lastToolEl = null;
   }
 }
-

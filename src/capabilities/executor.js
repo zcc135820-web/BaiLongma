@@ -28,6 +28,7 @@ export { persistAppState } from './tools/ui.js'
 
 import { config, setSecurity } from '../config.js'
 import { lookupReplyTarget, normalizeChannel, suggestProactiveChannel } from '../identity.js'
+import { compactMeaningFirstReply } from '../runtime/reply-cleanup.js'
 
 // 工具执行器：根据工具名和参数执行对应操作，返回结果字符串
 async function executeToolUnchecked(name, args, context = {}) {
@@ -277,6 +278,14 @@ function dedupeConsecutiveReplyLines(content) {
       continue
     }
 
+    if (previousCompact && isNearDuplicateReplyLine(previousLine, line)) {
+      if (preferCurrentReplyLine(previousLine, line)) {
+        result[result.length - 1] = line
+        previousCompact = compact
+      }
+      continue
+    }
+
     if (previousCompact && compact.length <= 180 && previousCompact.length <= 180 && charSimilarity(previousLine, line) >= 0.78) {
       continue
     }
@@ -315,6 +324,71 @@ function charSimilarity(a, b) {
   let overlap = 0
   for (const ch of left) if (right.has(ch)) overlap++
   return overlap / Math.max(left.size, right.size)
+}
+
+const NEAR_DUPLICATE_ANCHORS = [
+  '\u767d\u9f99\u9a6c',
+  'bailongma',
+  '\u5b98\u7f51',
+  '\u7f51\u7ad9',
+  'agent',
+  'ai',
+  '\u535a\u5ba2',
+  '\u6587\u6863',
+  'github',
+  '\u4e0b\u8f7d',
+  '\u5165\u53e3',
+  '\u8bb0\u5fc6',
+  '\u56fe\u8c31',
+  '\u4ea7\u54c1',
+  '\u9875\u9762',
+]
+
+function meaningFingerprint(line) {
+  return compactReplyLine(line)
+    .toLowerCase()
+    .replace(/bailongma/g, '\u767d\u9f99\u9a6c')
+    .replace(/ai\s*agent/g, 'agent')
+    .replace(/[\s`'"“”‘’、。?!？！；;：:，,（）()【】[\]《》<>「」『』\-—_]/g, '')
+}
+
+function meaningSimilarity(a, b) {
+  const left = new Set([...meaningFingerprint(a)])
+  const right = new Set([...meaningFingerprint(b)])
+  if (!left.size || !right.size) return 0
+  let overlap = 0
+  for (const ch of left) if (right.has(ch)) overlap++
+  return overlap / Math.max(left.size, right.size)
+}
+
+function sharedAnchorCount(a, b) {
+  const left = compactReplyLine(a).toLowerCase().replace(/bailongma/g, '\u767d\u9f99\u9a6c')
+  const right = compactReplyLine(b).toLowerCase().replace(/bailongma/g, '\u767d\u9f99\u9a6c')
+  return NEAR_DUPLICATE_ANCHORS.filter(anchor => left.includes(anchor) && right.includes(anchor)).length
+}
+
+function isStructuredLine(line) {
+  return /^\s*(?:[-*]|\d+[.)]|#{1,6}\s|```)/.test(String(line || ''))
+}
+
+function isNearDuplicateReplyLine(previousLine, line) {
+  const previous = compactReplyLine(previousLine)
+  const current = compactReplyLine(line)
+  if (previous.length < 18 || current.length < 18) return false
+  if (previous.length > 260 || current.length > 260) return false
+  if (isStructuredLine(previousLine) || isStructuredLine(line)) return false
+  const anchors = sharedAnchorCount(previousLine, line)
+  if (anchors < 2) return false
+  const similarity = meaningSimilarity(previousLine, line)
+  return similarity >= 0.66 || (anchors >= 5 && similarity >= 0.5)
+}
+
+function preferCurrentReplyLine(previousLine, line) {
+  const previous = compactReplyLine(previousLine)
+  const current = compactReplyLine(line)
+  const previousScore = previous.length + sharedAnchorCount(previousLine, previousLine) * 12
+  const currentScore = current.length + sharedAnchorCount(line, line) * 12
+  return currentScore >= previousScore
 }
 
 function isPathOnlyLine(line) {
@@ -402,7 +476,10 @@ async function execSendMessage({ target_id, content, channel = 'AUTO' }, context
 
   const resolvedId = resolveAllowedTargetId(target_id, context.allowedTargetIds)
   assertVisibleTargetId(resolvedId, context.visibleTargetIds)
-  const cleanedContent = dedupeConsecutiveReplyLines(trimAssistantFluff(content))
+  const cleanedContent = compactMeaningFirstReply(
+    dedupeConsecutiveReplyLines(trimAssistantFluff(content)),
+    { userMessage: context.currentUserMessage, channel: context.currentChannel }
+  )
   if (!cleanedContent) return '错误：消息内容为空'
 
   const delivery = resolveDeliveryTarget(resolvedId, channel, context)

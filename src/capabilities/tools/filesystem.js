@@ -15,7 +15,33 @@ export async function execReadFile(args, context = {}) {
   const filePath = normalizeSandboxPath(rawPath)
   const resolved = path.resolve(SANDBOX_ROOT, filePath)
   assertInSandbox(resolved)
-  return fs.readFileSync(resolved, 'utf-8')
+  const content = fs.readFileSync(resolved, 'utf-8')
+  const hasRange = args.start_line !== undefined || args.end_line !== undefined || args.max_lines !== undefined
+  if (!hasRange) return content
+
+  const lines = content.split(/\r?\n/)
+  const start = Math.max(1, parseInt(args.start_line ?? 1, 10) || 1)
+  const maxLines = args.max_lines !== undefined
+    ? Math.max(0, parseInt(args.max_lines, 10) || 0)
+    : null
+  const requestedEnd = args.end_line !== undefined
+    ? Math.max(start, parseInt(args.end_line, 10) || start)
+    : null
+  const end = maxLines !== null
+    ? Math.min(lines.length, start + maxLines - 1)
+    : Math.min(lines.length, requestedEnd ?? lines.length)
+  const selected = maxLines === 0 ? [] : lines.slice(start - 1, end)
+  return toolJson({
+    ok: true,
+    tool: 'read_file',
+    path: filePath,
+    absolute_path: resolved,
+    start_line: start,
+    end_line: end,
+    total_lines: lines.length,
+    truncated: end < lines.length || start > 1,
+    content: selected.join('\n'),
+  })
 }
 
 export async function execListDir(args, context = {}) {

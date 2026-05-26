@@ -4,6 +4,7 @@ import { executeTool } from './capabilities/executor.js'
 import { getToolSchemas } from './capabilities/schemas.js'
 import { recordUsage, shouldThrottle } from './quota.js'
 import { insertActionLog } from './db.js'
+import { isTerminalInternalToolRound } from './runtime/tool-protocol.js'
 
 // 延迟创建 OpenAI 客户端：激活流程把 key 写入 config 后再调用这里，
 // 避免模块加载阶段就锁死尚未填入的 apiKey/baseURL。
@@ -589,6 +590,7 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
   let finalNudgeUsed = false
   let missingToolNudgeUsed = false
   let fakeToolNudgeUsed = false
+  let emptyReplyNudgeUsed = false
   const toolLoopState = createToolLoopState()
 
   for (let round = 0; round < TOOL_LOOP_LIMITS.maxRounds; round++) {
@@ -657,6 +659,14 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
           content: 'Tool results have returned, but you have not sent the user a final reply yet. Based on the available tool results, call send_message now to reply to the user. If information is insufficient, explain what was found, the failure source, and the limitations; do not end silently.',
         })
         finalNudgeUsed = true
+        continue
+      }
+      if (mustReply && !sentMessage && !allContent.trim() && !emptyReplyNudgeUsed) {
+        messages.push({
+          role: 'user',
+          content: 'You ended this user-message turn without sending a reply and without producing fallback text. You must now call send_message with a brief, useful response to the user. If no tools are needed, answer directly. Do not end silently.',
+        })
+        emptyReplyNudgeUsed = true
         continue
       }
       break
@@ -778,6 +788,7 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
 
     // 将本轮 assistant 消息（含工具调用）加入对话
     // 若是 XML 解析的工具调用，assistant 消息用文本形式（避免 MiniMax 不支持 tool_calls 格式回放）
+    const terminalInternalRound = isTerminalInternalToolRound(effectiveToolCalls, { mustReply })
     const isXmlRound = toolCalls.length === 0 && effectiveToolCalls.length > 0
     if (isXmlRound) {
       // XML 工具调用：assistant 消息为纯文本，工具结果作为 user 消息注入
@@ -787,14 +798,16 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
       ).join('\n')
       // 同主路径：以 sentMessage（本轮最后一个动作是否是 send_message）为收尾依据，
       // 而不是只看本轮有没有出现过 send_message。
-      messages.push({
-        role: 'user',
-        content: sentMessage
-          ? `Tool execution results:\n${resultSummary}\n\nMessage sent. If you still need to send additional separate messages, call send_message again now. Otherwise end this round.`
-          : toolLoopStopReason
-            ? buildToolLoopStopNudge(toolLoopStopReason, lastToolResult)
-            : `Tool execution results:\n${resultSummary}\n\nContinue completing the task. If this is a user message and the information is sufficient, call send_message to give the user a final reply. If a tool failed, explain the failure and available clues; do not end silently.`,
-      })
+      if (!terminalInternalRound) {
+        messages.push({
+          role: 'user',
+          content: sentMessage
+            ? `Tool execution results:\n${resultSummary}\n\nMessage sent. If you still need to send additional separate messages, call send_message again now. Otherwise end this round.`
+            : toolLoopStopReason
+              ? buildToolLoopStopNudge(toolLoopStopReason, lastToolResult)
+              : `Tool execution results:\n${resultSummary}\n\nContinue completing the task. If this is a user message and the information is sufficient, call send_message to give the user a final reply. If a tool failed, explain the failure and available clues; do not end silently.`,
+        })
+      }
     } else {
       const assistantMsg = {
         role: 'assistant',
@@ -816,6 +829,7 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
           content: String(tr.result)
         })
       }
+      if (terminalInternalRound) break
       // "send_message 是不是本轮最后一个动作"才是判断"能不能收尾"的正确信号。
       // 旧逻辑只看 hasSendMessage（本轮任意位置出现过 send_message），
       // 会让 [send_message("我查一下..."), exec_command, exec_command] 这种"先说一句再去查"的链条
@@ -837,6 +851,7 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
         })
       }
     }
+    if (terminalInternalRound) break
   }
 
   return { content: allContent, toolResult: lastToolResult, aborted: signal?.aborted ?? false }

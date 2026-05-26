@@ -1180,7 +1180,10 @@ function handle({ type, data = {} }) {
     case "tool_executing": {
       const stream = currentStream();
       const label = data.name ? stream.toolLabel(data.name) : "工具";
-      stream.setStatus(`正在执行 ${label}…`, "busy");
+      stream.setTimedStatus(`正在执行 ${label}…`, "busy", {
+        staleAfterMs: 45000,
+        staleText: `执行 ${label} 时间偏长，仍在等结果…`,
+      });
       break;
     }
     case "tool_call":
@@ -1188,6 +1191,9 @@ function handle({ type, data = {} }) {
       break;
     case "response":
       // Round complete — stop all animations
+      currentStream().end();
+      break;
+    case "processing_preempted":
       currentStream().end();
       break;
     case "llm_retry": {
@@ -1211,7 +1217,13 @@ function handle({ type, data = {} }) {
       if (isBusyErrorMessage(data.error)) {
         currentStream().startThinkingSession();
         currentStream().setStatus("LLM 繁忙，请稍后重试", "busy");
+      } else {
+        currentStream().stopThinking();
+        currentStream().setStatus(data.error || "处理失败", "failed");
       }
+      break;
+    case "protocol_violation":
+      currentStream().end();
       break;
     case "injector_result": {
       const nids = [...extractNids(data.matchedMemories), ...extractNids(data.recallMemories)];

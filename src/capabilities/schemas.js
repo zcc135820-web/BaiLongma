@@ -60,13 +60,25 @@ export const TOOL_SCHEMAS = {
     type: 'function',
     function: {
       name: 'read_file',
-      description: 'Read the contents of a file at the specified path.',
+      description: 'Read the contents of a file at the specified path. Use start_line/end_line/max_lines when the user asks for a limited range such as "first 120 lines"; do not read the whole file when a range is enough.',
       parameters: {
         type: 'object',
         properties: {
           path: {
             type: 'string',
             description: 'Absolute or relative file path.'
+          },
+          start_line: {
+            type: 'number',
+            description: 'Optional 1-based first line to read.'
+          },
+          end_line: {
+            type: 'number',
+            description: 'Optional 1-based last line to read, inclusive.'
+          },
+          max_lines: {
+            type: 'number',
+            description: 'Optional maximum number of lines to return, starting from start_line or line 1.'
           }
         },
         required: ['path']

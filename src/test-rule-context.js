@@ -39,6 +39,7 @@ try {
   const { selectTools } = await import('./memory/tool-router.js')
   const { execManageRule } = await import('./capabilities/tools/rules.js')
   const { collectLocalResources } = await import('./local-resources-scanner.js')
+  const { __setInstalledSoftwareForTest } = await import('./installed-software-scanner.js')
   const { runRuntimeInjector } = await import('./context/runtime-injector.js')
 
   const fakeIp = '203.0.113.77'
@@ -56,6 +57,10 @@ try {
   fs.writeFileSync(path.join(sshDir, 'test_key.pub'), 'fake-public-key-not-used', 'utf8')
 
   collectLocalResources()
+  __setInstalledSoftwareForTest([
+    { name: 'Clash Verge Rev', version: '2.0.0', publisher: 'Test Publisher' },
+    { name: 'Visual Studio Code' },
+  ])
 
   const systemPrompt = buildSystemPrompt({
     agentName: 'RuleTestAgent',
@@ -69,6 +74,7 @@ try {
   assert(!generic.contextText.includes(fakeIp), 'generic chat does not inject SSH IP')
   assert(!generic.contextText.includes(fakeAlias), 'generic chat does not inject SSH alias')
   assert(!generic.contextText.includes('ssh_powershell_remote_shell_quoting'), 'generic chat does not inject SSH quoting rule')
+  assert(!generic.contextText.includes('Installed Software Snapshot'), 'generic chat does not inject installed software')
 
   const sshTask = await runRuntimeInjector({ message: 'login to my server with ssh and run hostname' })
   assert(sshTask.contextText.includes('<rule-context id="ssh_local_resources"'), 'SSH keyword injects local resources')
@@ -76,6 +82,11 @@ try {
   assert(sshTask.contextText.includes('<rule-context id="ssh_powershell_remote_shell_quoting"'), 'SSH keyword injects PowerShell quoting rule')
   assert(sshTask.contextText.includes('Get-Date'), 'PowerShell quoting rule includes Get-Date failure hint')
   assert(sshTask.contextText.includes('do not quote hostnames, IP addresses'), 'SSH context includes privacy instruction')
+
+  const softwareQuestion = await runRuntimeInjector({ message: '你知道我用了什么软件代理到那个位置吗' })
+  assert(softwareQuestion.contextText.includes('<rule-context id="installed_software_snapshot"'), 'software wording injects installed software context')
+  assert(softwareQuestion.contextText.includes('Clash Verge Rev'), 'installed software context includes proxy candidate')
+  assert(softwareQuestion.contextText.includes('Do not claim an app is installed unless it appears here.'), 'installed software context includes evidence warning')
 
   const ruleTools = selectTools({ messageBody: '创建一条上下文规则' })
   assert(ruleTools.includes('manage_rule'), 'rule-management wording exposes manage_rule')

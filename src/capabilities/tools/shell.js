@@ -1,5 +1,5 @@
 import path from 'path'
-import { spawn } from 'child_process'
+import { spawn, spawnSync } from 'child_process'
 import { nowTimestamp } from '../../time.js'
 import { emitEvent } from '../../events.js'
 import { config } from '../../config.js'
@@ -64,13 +64,61 @@ function trimCommandOutput(value = '', max = 6000) {
 
 // exec_command：在沙盒目录内执行 shell 命令
 // background=true 时后台运行，返回 PID；否则等待完成，返回输出
+export function isLikelyLongRunningCommand(command = '') {
+  const text = String(command || '').trim()
+  if (!text) return false
+  return /\b(watch|tail\s+-f|tail\s+--follow|journalctl\b.*\s-f|ping\s+-t|top|htop|npm\s+run\s+(dev|start)|pnpm\s+(dev|start)|yarn\s+(dev|start)|vite\b|next\s+dev|node\s+.*server|python\s+.*server|uvicorn|gunicorn)\b/i.test(text)
+    || /\bssh\b[\s\S]*\b(watch|tail\s+-f|journalctl\b.*\s-f|top|htop)\b/i.test(text)
+}
+
+function terminateProcessTree(child, pid = child?.pid) {
+  if (!pid) {
+    try { child?.kill?.() } catch {}
+    return { ok: false, error: 'missing pid' }
+  }
+  if (IS_WIN) {
+    const result = spawnSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+      encoding: 'utf8',
+      windowsHide: true,
+    })
+    if (result.status === 0) return { ok: true }
+    try { child?.kill?.() } catch {}
+    return {
+      ok: false,
+      error: (result.stderr || result.stdout || `taskkill exited with ${result.status}`).trim(),
+    }
+  }
+  try {
+    child?.kill?.()
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: err.message }
+  }
+}
+
+export function getCommandFailureHint(command = '', stderr = '', stdout = '') {
+  const combined = `${stderr || ''}\n${stdout || ''}`
+  const text = String(combined)
+  if (/\bssh\b/i.test(command) && /syntax error:\s*unexpected end of file/i.test(text)) {
+    return 'The remote shell command reached bash with broken quoting or an unfinished block. Do not retry the same SSH command. Simplify the remote command, avoid multiline nested quotes from PowerShell, or pass a small bash -lc script with carefully escaped single quotes.'
+  }
+  if (/\bssh\b/i.test(command) && /unexpected EOF while looking for matching/i.test(text)) {
+    return 'SSH itself likely connected, but the remote command quoting was unbalanced. Fix the quote escaping before retrying; this is not evidence that the server service is down.'
+  }
+  if (/The string is missing the terminator/i.test(text)) {
+    return 'Local PowerShell rejected the command before it reached the target. Fix local quote escaping; avoid multiline remote shell snippets inside a single PowerShell command.'
+  }
+  return null
+}
+
 export async function execCommand(args, context = {}) {
   throwIfAborted(context.signal)
   const command = String(args.command || args.cmd || '').trim()
   if (!command) return toolJson({ ok: false, tool: 'exec_command', error: 'missing command' })
 
   const background = args.background === true || args.background === 'true'
-  const promoteToBackground = args.promote_to_background === true || args.promote_to_background === 'true'
+  const autoPromote = isLikelyLongRunningCommand(command)
+  const promoteToBackground = args.promote_to_background === true || args.promote_to_background === 'true' || autoPromote
   // schema 说明单位是秒，转换为毫秒；兼容旧调用（如果传入 >1000 视为已是毫秒）
   const rawTimeout = Number(args.timeout) || 30
   const timeoutMs = Math.max(1000, Math.min(rawTimeout < 1000 ? rawTimeout * 1000 : rawTimeout, 120000))
@@ -83,7 +131,7 @@ export async function execCommand(args, context = {}) {
   }
 
   console.log(`[exec_command] ${background ? '[后台]' : '[前台]'} ${command} (cwd: ${execCwd})`)
-  emitEvent('exec_command', { command, background, cwd: execCwd })
+  emitEvent('exec_command', { command, background, cwd: execCwd, auto_promote: autoPromote })
 
   if (background) {
     return execBackground(command, execCwd)
@@ -167,7 +215,7 @@ function execForeground(command, timeoutMs, signal, execCwd, promoteToBackground
 
     const merged = createMergedAbortSignal(signal)
     const onAbort = () => {
-      child.kill()
+      terminateProcessTree(child)
       finish(toolJson({
         ok: false,
         tool: 'exec_command',
@@ -181,7 +229,7 @@ function execForeground(command, timeoutMs, signal, execCwd, promoteToBackground
       }))
     }
     if (merged?.signal.aborted) {
-      child.kill()
+      terminateProcessTree(child)
       finish(toolJson({
         ok: false,
         tool: 'exec_command',
@@ -232,7 +280,7 @@ function execForeground(command, timeoutMs, signal, execCwd, promoteToBackground
           hint: `Foreground timed out after ${timeoutMs / 1000}s — process promoted to background with pid ${pid}. Use list_processes to monitor it.`,
         }))
       } else {
-        child.kill()
+        terminateProcessTree(child)
         finish(toolJson({
           ok: false,
           tool: 'exec_command',
@@ -264,6 +312,7 @@ function execForeground(command, timeoutMs, signal, execCwd, promoteToBackground
 
     child.on('close', (code) => {
       if (timedOut) return
+      const failureHint = code === 0 ? null : getCommandFailureHint(command, stderr, stdout)
       finish(toolJson({
         ok: code === 0,
         tool: 'exec_command',
@@ -274,7 +323,7 @@ function execForeground(command, timeoutMs, signal, execCwd, promoteToBackground
         stdout: trimCommandOutput(stdout),
         stderr: trimCommandOutput(stderr),
         error: code === 0 ? null : `command exited with code ${code}`,
-        hint: code === 0 ? 'Command completed successfully.' : 'Inspect stderr/stdout before retrying or changing the command.',
+        hint: code === 0 ? 'Command completed successfully.' : (failureHint || 'Inspect stderr/stdout before retrying or changing the command.'),
       }))
     })
 
@@ -300,14 +349,15 @@ export async function execKillProcess(args) {
   if (!pid) return toolJson({ ok: false, tool: 'kill_process', error: 'missing pid' })
   const entry = bgProcesses.get(pid)
   if (!entry) return toolJson({ ok: false, tool: 'kill_process', pid, error: 'process not found or already exited' })
-  entry.process.kill()
+  const stopped = terminateProcessTree(entry.process, pid)
   bgProcesses.delete(pid)
   return toolJson({
-    ok: true,
+    ok: stopped.ok,
     tool: 'kill_process',
     pid,
     command: entry.command,
-    stopped: true,
+    stopped: stopped.ok,
+    error: stopped.ok ? null : stopped.error,
   })
 }
 

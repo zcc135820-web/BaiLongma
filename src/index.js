@@ -28,12 +28,16 @@ import { startSocialConnectors } from './social/index.js'
 import { getWeatherCardProps, isWeatherQuery } from './weather.js'
 import { collectSystemInfo, getSystemInfoBlock, getBatteryBlock, getDesktopPath } from './system-info.js'
 import { collectDesktopInfo, getDesktopBlock } from './desktop-scanner.js'
+import { collectInstalledSoftware, getInstalledSoftwareBlock } from './installed-software-scanner.js'
 import { collectLocalResources } from './local-resources-scanner.js'
 import { collectGeoWeather, getGeoWeatherBlock } from './geo-weather.js'
 import { collectTrending, getTrendingBlock } from './trending.js'
 import { collectAgents, buildAgentContextBlock, buildDelegationAskDirections } from './agents/registry.js'
 import { tryAutoConfigureKey } from './key-auto-config.js'
 import { PRIMARY_USER_ID, formatPresenceForPrompt, normalizeChannel } from './identity.js'
+import { compactMeaningFirstReply, dedupeReplyLines, requiresToolForUserMessage, trimAssistantFluff } from './runtime/reply-cleanup.js'
+import { truncateToolResultForUI } from './runtime/tool-result-preview.js'
+import { buildLLMMessages } from './runtime/messages.js'
 
 // On first launch, copy sandbox seed files from the resource directory to the user data directory (Electron install)
 seedSandboxOnce()
@@ -45,6 +49,9 @@ await collectSystemInfo()
 
 // Scan the user's desktop (shortcuts cached by mtime, regular files scanned every time)
 collectDesktopInfo(getDesktopPath())
+
+// Scan installed software once so software/app/proxy questions can use local evidence.
+collectInstalledSoftware()
 
 // Scan the user's local resources (ssh hosts, keys, known_hosts, git identity)
 // for the "Self-Sufficient Execution" prompt — so the agent already knows what
@@ -189,6 +196,25 @@ const state = {
 
 const TASK_IDLE_TICK_LIMIT = 5  // auto-clear task after N consecutive task ticks with no tool calls
 
+function summarizeToolCall(t = {}) {
+  const args = t.args || {}
+  const status = t.ok === false ? ' failed' : ''
+  if (t.name === 'send_message') return `send_message -> ${args.target_id || args.to || 'unknown'}${status}`
+  if (t.name === 'fetch_url') return `fetch_url(${String(args.url || '').slice(0, 60)})${status}`
+  if (t.name === 'write_file') return `write_file(${args.path || args.filename || args.file_path || '?'})${status}`
+  if (t.name === 'read_file') {
+    const pathArg = args.path || args.filename || args.file_path || '?'
+    const rangeParts = []
+    if (args.start_line !== undefined) rangeParts.push(`start=${args.start_line}`)
+    if (args.end_line !== undefined) rangeParts.push(`end=${args.end_line}`)
+    if (args.max_lines !== undefined) rangeParts.push(`max=${args.max_lines}`)
+    const range = rangeParts.length ? ` ${rangeParts.join(' ')}` : ''
+    return `read_file(${pathArg}${range})${status}`
+  }
+  if (t.name === 'exec_command') return `exec_command(${String(args.command || '').slice(0, 80)})${status}`
+  return `${t.name || 'tool'}${status}`
+}
+
 function autoCompleteTask(reason) {
   const clearedTask = state.task
   state.task = null
@@ -263,151 +289,6 @@ function buildStartupSelfCheckDirections(checkState) {
     `Result values: use ok, degraded, error, or skipped_* for each item. Continue to the next item even if one fails.`,
     `[FINAL TWO STEPS — REQUIRED]\n(a) Call ui_show to display SelfCheckCard with props: { results: [{name:"文件读写",status:"ok/error",...},{name:"热点面板",...},{name:"视频模式",...}], overall:"ok/degraded/error" }. Infer overall from actual results: all ok → ok; any skipped → degraded; any error → error.\n(b) Call complete_startup_self_check with a summary (one sentence) and the results object.`,
   ].join('\n')
-}
-
-// 把工具结果压缩成"前端可安全 JSON.parse"的字符串。
-// 原本用 slice(0, 1000) 会从字符串中间切断 JSON，让 thought-stream 的人类化格式器拿不到结构，
-// 只能回退展示原始（残缺的）JSON 文本。
-function truncateToolResultForUI(parsed, raw) {
-  if (parsed && typeof parsed === 'object') {
-    const compact = compactToolPayload(parsed)
-    const out = JSON.stringify(compact)
-    if (out.length <= 4000) return out
-    return out.slice(0, 4000)
-  }
-  return String(raw ?? '').slice(0, 1000)
-}
-
-function compactToolPayload(payload) {
-  if (Array.isArray(payload)) {
-    return payload.slice(0, 10).map(compactToolPayload)
-  }
-  if (payload && typeof payload === 'object') {
-    const out = {}
-    for (const [k, v] of Object.entries(payload)) {
-      if (typeof v === 'string' && v.length > 600) {
-        const cut = v.slice(0, 600)
-        out[k] = `${cut}…（已截断，原 ${v.length} 字符）`
-      } else if (v && typeof v === 'object') {
-        out[k] = compactToolPayload(v)
-      } else {
-        out[k] = v
-      }
-    }
-    return out
-  }
-  return payload
-}
-
-function trimAssistantFluff(content) {
-  let text = String(content || '').trim()
-  if (!text) return text
-
-  text = text
-    .replace(/^(?:\s*\[assistant(?:\s+to\s+[^\]\r\n]+)?(?:\s+\d{4}-\d{2}-\d{2}T[^\]\r\n]+)?\]\s*)+/giu, '')
-    .trim()
-
-  const patterns = [
-    /[，,、。.!！？~～\s]*(?:从现在起|从今以后|以后)?我就是[\u4e00-\u9fa5A-Za-z0-9 _-]{1,24}[，,、。.!！？~～\s]*为您效劳[！!～~。.\s]*$/u,
-    /[，,、。.!！？~～\s]*有什么需要帮忙的[？?]?[，,、。.!！？~～\s]*(?:随时)?为您效劳[～~！!。.\s]*$/u,
-    /[，,、。.!！？~～\s]*有什么需要我帮忙的[？?]?[，,、。.!！？~～\s]*(?:随时)?为您效劳[～~！!。.\s]*$/u,
-    /[，,、。.!！？~～\s]*随时为您效劳[～~！!。.\s]*$/u,
-    /[，,、。.!！？~～\s]*为您效劳[～~！!。.\s]*$/u,
-    /[，,、。.!！？~～\s]*有什么需要帮忙的[？?]?[～~！!。.\s]*$/u,
-    /[，,、。.!！？~～\s]*有什么需要我帮忙的[？?]?[～~！!。.\s]*$/u,
-  ]
-
-  let changed = true
-  while (changed) {
-    changed = false
-    for (const pattern of patterns) {
-      const next = text.replace(pattern, '').trim()
-      if (next !== text) {
-        text = next
-        changed = true
-      }
-    }
-  }
-
-  return text
-}
-
-function compactReplyLine(line) {
-  return String(line || '')
-    .trim()
-    .replace(/^[`'"“”‘’]+|[`'"“”‘’。.!！?？,，:：;；\s]+$/g, '')
-    .replace(/\s+/g, ' ')
-}
-
-function normalizePathEcho(line) {
-  return compactReplyLine(line)
-    .replace(/`/g, '')
-    .replace(/[\\\/]+/g, '/')
-    .toLowerCase()
-}
-
-function lineFingerprint(line) {
-  return compactReplyLine(line)
-    .replace(/[`'"“”‘’。.!！?？,，:：;；、\s]/g, '')
-    .toLowerCase()
-}
-
-function charSimilarity(a, b) {
-  const left = new Set([...lineFingerprint(a)])
-  const right = new Set([...lineFingerprint(b)])
-  if (!left.size || !right.size) return 0
-  let overlap = 0
-  for (const ch of left) if (right.has(ch)) overlap++
-  return overlap / Math.max(left.size, right.size)
-}
-
-function isPathOnlyLine(line) {
-  const normalized = normalizePathEcho(line)
-  return /^[a-z]:\/[^<>|?*\r\n]+$/i.test(normalized) || /^\/[^<>|?*\r\n]+$/.test(normalized)
-}
-
-function dedupeReplyLines(content) {
-  const lines = String(content || '').split(/\r?\n/)
-  const result = []
-  let previousCompact = ''
-
-  for (const line of lines) {
-    const compact = compactReplyLine(line)
-    if (!compact) {
-      result.push(line)
-      continue
-    }
-
-    const previousLine = result.length ? result[result.length - 1] : ''
-    const previousPath = normalizePathEcho(previousLine)
-    const currentPath = normalizePathEcho(line)
-
-    if (compact === previousCompact) continue
-
-    if (isPathOnlyLine(previousLine) && currentPath.includes(previousPath) && currentPath.length > previousPath.length) {
-      result[result.length - 1] = line
-      previousCompact = compact
-      continue
-    }
-
-    if (previousCompact && compact.length <= 180 && previousCompact.length <= 180 && charSimilarity(previousLine, line) >= 0.78) {
-      continue
-    }
-
-    result.push(line)
-    previousCompact = compact
-  }
-
-  return result.join('\n').trim()
-}
-
-function requiresToolForUserMessage(text = '') {
-  const input = String(text || '')
-  const fileIntent = /(sandbox|文件|目录|创建|新建|写入|读取|删除|列出|保存|test-\d+|\.txt|\.json|\.md|\.js|\.html|\.css)/i.test(input)
-    && /(创建|新建|写入|读取|删除|列出|保存|改|修改|生成|create|write|read|delete|list|save)/i.test(input)
-  const commandIntent = /(执行命令|运行命令|跑命令|exec|command|npm|node|git|powershell|cmd)/i.test(input)
-  const webIntent = /(打开网页|抓取|联网|搜索|查询最新|fetch|url|https?:\/\/)/i.test(input)
-  return fileIntent || commandIntent || webIntent
 }
 
 function hasNonMessageToolCall(toolCallLog = []) {
@@ -514,6 +395,7 @@ function buildToolContextForProcess(msg, injection) {
     // 当前 turn 的渠道信息：execSendMessage 在 AUTO 模式下优先用这里，确保"在哪儿收的消息就回到哪儿"
     currentChannel: msg?.channel || null,
     currentExternalPartyId: msg?.externalPartyId || null,
+    currentUserMessage: msg?.content || null,
 
     onSetTask: (description, steps) => {
       state.task = description
@@ -598,160 +480,6 @@ function resolveTurnTools(injectedTools = [], { silentSignal = false } = {}) {
   const tools = Array.isArray(injectedTools) ? injectedTools.filter(Boolean) : []
   if (!tools.includes('send_message')) tools.unshift('send_message')
   return tools
-}
-
-function formatConversationMessage(row, currentMsg = null, prevChannel = '') {
-  if (row.role === 'jarvis') {
-    // Jarvis 出站的渠道也标出来，让模型能"看到"自己上次回到了哪里
-    const rawChannel = row.channel || ''
-    const normalized = normalizeChannel(rawChannel)
-    const channelTag = (normalized && normalized !== 'TUI' && normalized !== 'SYSTEM') ? `[via ${normalized}] ` : ''
-    return {
-      role: 'assistant',
-      content: `${channelTag}${trimAssistantFluff(row.content || '')}`,
-    }
-  }
-
-  // Truncate timestamp to minute precision (drop seconds and timezone)
-  const ts = row.timestamp ? row.timestamp.slice(0, 16).replace('T', ' ') : ''
-  const rawChannel = row.channel || currentMsg?.channel || ''
-  const normalizedChannel = normalizeChannel(rawChannel)
-
-  const isSystemSignal = row.from_id === 'SYSTEM' || normalizedChannel === 'SYSTEM' || rawChannel === 'APP_SIGNAL' || rawChannel === 'REMINDER'
-
-  if (isSystemSignal) {
-    const channelLabel = rawChannel ? ` · ${rawChannel}` : ''
-    return {
-      role: 'user',
-      content: `[system signal · ${ts}${channelLabel}]\n${row.content || ''}\n(Respond with tools only. Do NOT call send_message.)`.trim(),
-    }
-  }
-
-  const isCurrent = currentMsg
-    && row.role === 'user'
-    && row.from_id === currentMsg.fromId
-    && row.timestamp === currentMsg.timestamp
-    && row.content === currentMsg.content
-  const marker = isCurrent ? 'current user message' : 'user message'
-  // 简化后的渠道：TUI 视为默认不显示；其他（WECHAT/DISCORD/FEISHU/WECOM）显示
-  let channelLabel = (normalizedChannel && normalizedChannel !== 'TUI') ? ` · ${normalizedChannel}` : ''
-
-  // channel 切换提示：本条消息相对上一条的入口换了，给模型一个显眼的指代锚点。
-  // 主要场景：用户在 TUI 聊到一半切到微信继续问"那现在呢？"——必须让 LLM 知道
-  // 入口变了、感知能力也跟着变了，否则代词会被 runtime 块（电池/系统块）抢走。
-  if (prevChannel && normalizedChannel && prevChannel !== normalizedChannel) {
-    channelLabel += ` (channel switch: ${prevChannel} → ${normalizedChannel})`
-  }
-
-  return {
-    role: 'user',
-    content: `[${marker} · ${row.from_id || 'unknown'} · ${ts}${channelLabel}]\n${row.content || ''}`.trim(),
-  }
-}
-
-function formatTaskSteps(taskSteps = []) {
-  if (!taskSteps?.length) return ''
-  const statusIcon = { done: '✓', failed: '✗', skipped: '—', pending: '○' }
-  const lines = taskSteps.map((s, i) => {
-    const icon = statusIcon[s.status] || '○'
-    const note = s.note ? ` (${s.note})` : ''
-    return `  ${i + 1}. [${icon}] ${s.text}${note}`
-  })
-  const done = taskSteps.filter(s => s.status === 'done').length
-  const total = taskSteps.length
-  return `Task step progress (${done}/${total}):\n${lines.join('\n')}`
-}
-
-function buildRuntimeContextMessages({ recentActions = [], actionLog = [], lastToolResult = null, taskSteps = [], batteryBlock = '' } = {}) {
-  const parts = []
-
-  if (batteryBlock) {
-    parts.push(batteryBlock)
-  }
-
-  if (taskSteps?.length > 0) {
-    parts.push(formatTaskSteps(taskSteps))
-  }
-
-  if (recentActions?.length > 0) {
-    const lines = recentActions.map(item => `- ${item.ts?.slice(11, 16) || ''} ${item.summary || ''}`).join('\n')
-    parts.push(`Recent assistant actions:\n${lines}\nAvoid immediately repeating the same action unless the current user message asks for it.`)
-  }
-
-  if (actionLog?.length > 0) {
-    const lines = actionLog.slice(-10).map(item => {
-      const time = item.timestamp?.slice(11, 16) || ''
-      const detail = item.detail ? `\n  ${item.detail}` : ''
-      return `- ${time} ${item.tool || ''} · ${item.summary || ''}${detail}`
-    }).join('\n')
-    parts.push(`Recent tool/action log:\n${lines}\nUse this as runtime context only. Do not repeat completed actions unless the current task requires it.`)
-  }
-
-  if (lastToolResult) {
-    const argsSummary = Object.entries(lastToolResult.args || {})
-      .map(([key, value]) => `${key}=${String(value).slice(0, 60)}`)
-      .join(', ')
-    const resultPreview = String(lastToolResult.result || '').slice(0, 500)
-    parts.push(`Previous tool result:\n${lastToolResult.name}(${argsSummary}) ->\n${resultPreview}\nAbsorb this result before deciding the next step.`)
-  }
-
-  if (parts.length === 0) return []
-  return [{
-    role: 'user',
-    content: `[runtime context]\n${parts.join('\n\n')}`,
-  }]
-}
-
-function buildLLMMessages({ systemPrompt, contextBlock = '', conversationWindow = [], input, msg = null, recentActions = [], actionLog = [], lastToolResult = null, taskSteps = [], batteryBlock = '' }) {
-  const messages = [{ role: 'system', content: systemPrompt }]
-  messages.push(...buildRuntimeContextMessages({ recentActions, actionLog, lastToolResult, taskSteps, batteryBlock }))
-
-  const rows = Array.isArray(conversationWindow) ? conversationWindow : []
-  // Track which message in the array should receive this round's <context> block:
-  // it's the last user-role message representing the "current" turn — either the
-  // matched row from conversationWindow (when msg is already persisted to db) or
-  // the appended fallback message below (TICK / unmatched cases).
-  let currentMessageIndex = -1
-  // prevChannel 维护：上一条非 SYSTEM 消息的 normalized channel，用于在 marker
-  // 上标注 channel switch（"那现在呢"代词消解所依赖的核心信号之一）。
-  let prevChannel = ''
-
-  for (const row of rows) {
-    if (!row?.content) continue
-    const rowNorm = normalizeChannel(row.channel || '')
-    const isSystemRow = row.from_id === 'SYSTEM' || rowNorm === 'SYSTEM' || row.channel === 'APP_SIGNAL' || row.channel === 'REMINDER'
-    const formatted = formatConversationMessage(row, msg, isSystemRow ? '' : prevChannel)
-    if (!formatted.content) continue
-    messages.push(formatted)
-    const isCurrent = !!msg
-      && row.role === 'user'
-      && row.from_id === msg.fromId
-      && row.timestamp === msg.timestamp
-      && row.content === msg.content
-    if (isCurrent) currentMessageIndex = messages.length - 1
-    if (!isSystemRow && rowNorm) prevChannel = rowNorm
-  }
-
-  const hasCurrentMessage = currentMessageIndex >= 0
-
-  if (!hasCurrentMessage) {
-    messages.push({
-      role: 'user',
-      content: input,
-    })
-    currentMessageIndex = messages.length - 1
-  }
-
-  // Prepend this round's <context>...</context> to the current user message.
-  // The block is NOT persisted to db — conversations are written from the raw
-  // user content (see queue.pushMessage) and assistant outputs are stored
-  // verbatim, so the next round's conversationWindow stays clean.
-  if (contextBlock && currentMessageIndex >= 0) {
-    const target = messages[currentMessageIndex]
-    target.content = `${contextBlock}\n\n${target.content || ''}`
-  }
-
-  return messages
 }
 
 const MAX_MESSAGE_RETRIES = 3
@@ -892,6 +620,8 @@ function buildSystemEnv(msg) {
     blocks.push(getSystemInfoBlock())
   if (/桌面|快捷方式|桌面文件|桌面应用|已安装|浏览器|启动程序/.test(text))
     blocks.push(getDesktopBlock())
+  if (/软件|应用|程序|客户端|工具|装了什么|用了什么|代理|科学上网|翻墙|\bvpn\b|\bproxy\b|clash|mihomo|v2ray|xray|sing-?box|shadowrocket|shadowsocks|wireguard|tailscale|zerotier|openvpn/.test(text))
+    blocks.push(getInstalledSoftwareBlock())
   if (/天气|气温|温度|下雨|下雪|晴天|气候|风力|风速|台风|位置|城市|在哪个城市/.test(text))
     blocks.push(getGeoWeatherBlock())
   if (/热点|新闻|热搜|热榜|今天发生|最近发生|微博|知乎|头条/.test(text))
@@ -1062,10 +792,13 @@ async function runTurn(input, label, msg = null) {
       }
     }
     if (fastUserPath) {
-      directions.unshift('Current turn is a real-time external user message. Understand it quickly and reply directly with send_message before doing slow tools or deep context gathering. Use heavier tools only when the reply depends on them. During execution, whenever there is meaningful progress or a useful finding, send_message to keep the user in the loop. Do not ask for permission for actions you can safely perform; act, and speak when there is something worth saying.')
+      directions.unshift('Current turn is a real-time external user message. Understand it quickly and reply directly with send_message. If no slow tool is needed, send exactly one final answer and stop. Use heavier tools only when the reply depends on them. During longer execution, send progress only for meaningful new findings or blockers; do not send an acknowledgement and then a near-duplicate final answer.')
     }
     if (isVoiceChannel(msg?.channel)) {
+      directions.push('Voice mode: answer with judgment and meaning first. Do not read out an inventory. If details are merely evidence, compress them into the situation they prove.')
+      directions.push('Voice mode style: speak like a person in the room. Default to one or two short sentences. No Markdown, no bullets, no headings, no process acknowledgement, no repeated summary. Say the situation, then stop.')
       directions.push('The current user message came from voice input. Speak naturally and concisely — like talking to a person, not writing an article. Get to the point, avoid filler phrases, and do not use Markdown formatting (no bullet points, asterisks, or headers). Say what needs to be said and stop.')
+      directions.push('For voice input, do not send process acknowledgements like "I will look" or "let me check" before the answer. Send one compact answer unless you truly need a slow tool and have no result yet.')
       directions.push('If the voice input is clearly a speech recognition error (meaningless noise, garbled syllables, random characters) OR appears to be ambient speech not directed at you — such as someone nearby talking to another person, background conversation, or utterances with no plausible intent to address an AI assistant — silently ignore it: do NOT call send_message or any other tool. Only respond when the input is reasonably addressed to you.')
     }
 
@@ -1157,8 +890,8 @@ async function runTurn(input, label, msg = null) {
     const hasActiveTask = !!state.task
     const extraContextJoined = [presenceText, runtimeInjection.contextText, prefetchText, injection.uiSignalSummary, formatActiveUICards(injection.activeUICards)].filter(Boolean).join('\n\n')
 
-    // system 只留稳定硬底线（agent_name / persona / security）—— 让 DeepSeek prefix cache
-    // 真正命中。currentTime / existenceDesc / systemEnv 改走 <runtime> 段（每轮变化）。
+    // system 只留稳定硬底线（agent_name / persona）—— 让 DeepSeek prefix cache
+    // 真正命中。currentTime / existenceDesc / systemEnv / security 改走 <runtime> 段（每轮变化）。
     const systemPrompt = buildSystemPrompt({
       agentName,
       persona,
@@ -1250,13 +983,14 @@ async function runTurn(input, label, msg = null) {
 
     // 3. Call Jarvis LLM (can be interrupted by a new message)
     const toolContext = buildToolContextForProcess(msg, injection)
+    const voiceTurn = isVoiceChannel(msg?.channel)
+    const turnTools = resolveTurnTools(injection.tools, { silentSignal })
     llmResult = await callLLM({
       systemPrompt,
       message: input,
       messages: llmMessages,
-      tools: resolveTurnTools(injection.tools, { silentSignal }),
-      maxTokens: undefined,
-      temperature: config.temperature,
+      tools: turnTools,
+      temperature: voiceTurn ? Math.min(config.temperature, 0.35) : config.temperature,
       signal: controller.signal,
       toolContext,
       mustReply: !!msg?.fromId && !silentSignal,
@@ -1278,7 +1012,10 @@ async function runTurn(input, label, msg = null) {
         // 注：send_message 的 conversations 写入已由 executor.js 内统一处理（带 channel + external_party_id）
         // 这里仅处理语音输入的 TTS 自动回放
         if (name === 'send_message' && args?.content && isVoiceChannel(msg?.channel)) {
-          const cleanedContent = trimAssistantFluff(args.content)
+          const cleanedContent = compactMeaningFirstReply(
+            dedupeReplyLines(trimAssistantFluff(args.content)),
+            { userMessage: msg?.content || input, channel: msg?.channel }
+          )
           if (cleanedContent) autoSpeakForVoiceReply(cleanedContent)
         }
       },
@@ -1333,7 +1070,7 @@ async function runTurn(input, label, msg = null) {
   // 参见 lessons-bailongma-silent-exit。
   const lastToolCall = toolCallLog[toolCallLog.length - 1]
   if (msg && msg.fromId && lastToolCall?.name !== 'send_message') {
-    const fallbackContent = dedupeReplyLines(trimAssistantFluff(
+    const fallbackContent = compactMeaningFirstReply(dedupeReplyLines(trimAssistantFluff(
       response
         .replace(/<think>[\s\S]*?<\/think>/gi, '')
         .replace(/\[RECALL:\s*.+?\]/g, '')
@@ -1341,7 +1078,7 @@ async function runTurn(input, label, msg = null) {
         .replace(/\[CLEAR_TASK\]/g, '')
         .replace(/\[UPDATE_PERSONA:\s*[\s\S]+?\]/g, '')
         .trim()
-    ))
+    )), { userMessage: msg?.content || input, channel: msg?.channel })
 
     if (fallbackContent && requiresToolForUserMessage(input) && !hasNonMessageToolCall(toolCallLog)) {
       const timestamp = nowTimestamp()
@@ -1435,13 +1172,7 @@ async function runTurn(input, label, msg = null) {
 
   // Update recent action log (keep last 5)
   if (toolCallLog.length > 0) {
-    const summary = toolCallLog.map(t => {
-      if (t.name === 'send_message') return `send_message → ${t.args.target_id}`
-      if (t.name === 'fetch_url') return `fetch_url(${t.args.url?.slice(0, 40)})`
-      if (t.name === 'write_file') return `write_file(${t.args.path})`
-      if (t.name === 'read_file') return `read_file(${t.args.path})`
-      return t.name
-    }).join(', ')
+    const summary = toolCallLog.map(summarizeToolCall).join(', ')
     state.recentActions.push({ ts: nowTimestamp(), summary })
     if (state.recentActions.length > 5) state.recentActions.shift()
   }
